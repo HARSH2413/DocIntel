@@ -41,12 +41,31 @@ class ChatService:
         If the CONTEXT does not contain enough relevant information to answer the question, you must reply with exactly: "This information is not present in the current company documents."
         Under no circumstances should you use outside knowledge or make assumptions.
 
+        CRITICAL FORMATTING RULE:
+        You must output your response in pure, unformatted plain text ONLY. 
+        DO NOT use any markdown formatting, asterisks (**), bolding, hashes (###), dashes (-), or equals signs (===). 
+        Write your answers in clean, standard paragraphs.
+
         CONTEXT:
         {context_text}
         """
 
         # 6. Generate Answer
         answer = self.llm.generate_response(system_prompt=system_prompt, user_prompt=question)
+
+        # 🛡️ THE BULLETPROOF MARKDOWN STRIPPER
+        # This physically rips out the markdown characters before your frontend sees them.
+        answer = answer.replace("**", "").replace("*", "").replace("###", "").replace("===", "")
+
+        # 7. Package the Citations for the Split-Screen UI
+        citations = [
+            {
+                "filename": doc["filename"],
+                "content": doc["content"],
+                "similarity": doc.get("similarity", 0.0) # Pulled straight from pgvector math
+            }
+            for doc in retrieved_docs
+        ]
 
         # 7. Package the Citations for the Split-Screen UI
         citations = [

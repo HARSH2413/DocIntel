@@ -4,8 +4,11 @@ import React, { useState, useRef, useEffect } from 'react';
 import { 
   MessageSquare, Plus, FileText, Settings, HelpCircle, 
   Share2, ChevronRight, Send, Paperclip, MoreVertical, 
-  Maximize2, X, ExternalLink, Loader2, Info, Database
+  Maximize2, X, ExternalLink, Loader2, Info, Database,
+  CheckCircle2, AlertCircle
 } from 'lucide-react';
+// Import React Markdown
+import ReactMarkdown from 'react-markdown';
 
 // --- Types for Backend Integration ---
 interface Citation {
@@ -15,9 +18,14 @@ interface Citation {
 }
 
 interface ChatMessage {
-  role: 'user' | 'ai';
+  role: 'user' | 'ai' | 'assistant'; 
   content: string;
   citations?: Citation[];
+}
+
+interface ChatSession {
+  id: string;
+  title: string;
 }
 
 export default function SecureBrainDashboard() {
@@ -26,22 +34,102 @@ export default function SecureBrainDashboard() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputText, setInputText] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
-  
   const [currentView, setCurrentView] = useState<'chat' | 'documents'>('chat');
   
-  const [localFiles, setLocalFiles] = useState<Record<string, string>>({});
+  const [toast, setToast] = useState<{message: string, type: 'success' | 'error'} | null>(null);
+
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   
-  // NEW: State to hold files fetched directly from the database
+  const [localFiles, setLocalFiles] = useState<Record<string, string>>({});
   const [dbFiles, setDbFiles] = useState<string[]>([]);
   const [isLoadingDb, setIsLoadingDb] = useState(false);
   
+  // NEW: State to track if history is currently loading
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  
   // --- Refs & Config ---
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null); 
   const tenantId = "a4e69a0a-c349-4dd8-a923-e7c1ce02f0e6"; 
+
+  // --- Initialize & Local Storage ---
+  useEffect(() => {
+    const savedSessions = localStorage.getItem(`sessions_${tenantId}`);
+    if (savedSessions) {
+      const parsed = JSON.parse(savedSessions);
+      setSessions(parsed);
+      if (parsed.length > 0) {
+        loadSession(parsed[0].id);
+      }
+    } else {
+      createNewSession();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (sessions.length > 0) {
+      localStorage.setItem(`sessions_${tenantId}`, JSON.stringify(sessions));
+    }
+  }, [sessions]);
+
+  // Auto-scroll Effect
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages, isProcessing, isLoadingHistory]);
 
   // --- Backend Actions ---
 
-  // Fetch documents from DB
+  const showToast = (message: string, type: 'success' | 'error') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 4000); 
+  };
+
+  const createNewSession = async () => {
+    try {
+      const response = await fetch("http://localhost:8000/api/v1/chat/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tenant_id: tenantId, title: "New Conversation" })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        const newSession = { id: data.session_id, title: "New Conversation" };
+        setSessions(prev => [newSession, ...prev]);
+        setCurrentSessionId(newSession.id);
+        setMessages([]);
+        setCurrentView('chat');
+      }
+    } catch (err) {
+      console.error("Failed to create session", err);
+    }
+  };
+
+  const loadSession = async (sessionId: string) => {
+    setCurrentSessionId(sessionId);
+    setCurrentView('chat');
+    setActiveDoc(null);
+    setMessages([]);
+    setIsLoadingHistory(true); // START LOADING EFFECT
+    
+    try {
+      const response = await fetch(`http://localhost:8000/api/v1/chat/sessions/${sessionId}`);
+      if (response.ok) {
+        const data = await response.json();
+        if (data.history) setMessages(data.history);
+      }
+    } catch (err) {
+      console.error("Failed to load history", err);
+      showToast("Failed to load chat history.", "error");
+    } finally {
+      setIsLoadingHistory(false); // STOP LOADING EFFECT
+    }
+  };
+
   const fetchDatabaseFiles = async () => {
     setIsLoadingDb(true);
     try {
@@ -78,28 +166,37 @@ export default function SecureBrainDashboard() {
       });
 
       if (response.ok) {
-        const data = await response.json();
-        alert(`Success: ${data.message}`);
-        // Refresh DB files if we are on the documents view
+        showToast(`${file.name} successfully uploaded and indexed!`, 'success');
         if (currentView === 'documents') fetchDatabaseFiles();
       } else {
         const error = await response.json();
-        alert(`Upload Error: ${error.detail}`);
+        showToast(`Upload Error: ${error.detail}`, 'error');
       }
     } catch (err) {
-      console.error("Upload failed", err);
+      showToast("Network error during upload.", 'error');
     } finally {
       setIsProcessing(false);
+      if (fileInputRef.current) fileInputRef.current.value = ''; 
     }
   };
 
   const handleSendMessage = async () => {
     if (!inputText.trim() || isProcessing) return;
 
+    let activeSession = currentSessionId;
+    if (!activeSession) {
+       await createNewSession();
+       activeSession = currentSessionId; 
+    }
+
     const userQuery = inputText;
     setInputText("");
     setMessages(prev => [...prev, { role: 'user', content: userQuery }]);
     setIsProcessing(true);
+
+    if (messages.length === 0 && activeSession) {
+       setSessions(prev => prev.map(s => s.id === activeSession ? { ...s, title: userQuery.substring(0, 30) + '...' } : s));
+    }
 
     try {
       const response = await fetch("http://localhost:8000/api/v1/chat/", {
@@ -107,7 +204,8 @@ export default function SecureBrainDashboard() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question: userQuery,
-          tenant_id: tenantId
+          tenant_id: tenantId,
+          session_id: activeSession
         }),
       });
 
@@ -118,9 +216,11 @@ export default function SecureBrainDashboard() {
           content: data.answer, 
           citations: data.citations 
         }]);
+      } else if (response.status === 429) {
+        showToast("Rate limit exceeded. Please wait a moment.", "error");
       }
     } catch (err) {
-      console.error("Chat failed", err);
+      showToast("Failed to connect to AI engine.", "error");
     } finally {
       setIsProcessing(false);
     }
@@ -139,12 +239,19 @@ export default function SecureBrainDashboard() {
     return foundKey ? localFiles[foundKey] : undefined;
   };
 
-  // Combine local files and DB files, removing duplicates
   const allUniqueFiles = Array.from(new Set([...dbFiles, ...Object.keys(localFiles)]));
 
   return (
-    <div className="flex h-screen bg-white font-sans text-slate-800 overflow-hidden">
+    <div className="flex h-screen bg-white font-sans text-slate-800 overflow-hidden relative">
       
+      {/* --- TOAST NOTIFICATION --- */}
+      {toast && (
+        <div className={`fixed bottom-6 right-6 z-50 flex items-center gap-3 px-5 py-3.5 rounded-xl shadow-2xl font-medium animate-in slide-in-from-bottom-5 duration-300 ${toast.type === 'success' ? 'bg-slate-800 text-white' : 'bg-red-50 text-red-600 border border-red-200'}`}>
+          {toast.type === 'success' ? <CheckCircle2 size={18} className="text-green-400" /> : <AlertCircle size={18} />}
+          <span className="text-sm">{toast.message}</span>
+        </div>
+      )}
+
       {/* --- SIDEBAR --- */}
       <aside className="w-64 border-r border-slate-200 flex flex-col bg-slate-50/50 shrink-0">
         <div className="p-4 flex items-center gap-2 mb-4">
@@ -155,25 +262,39 @@ export default function SecureBrainDashboard() {
         </div>
 
         <button 
-          onClick={() => setCurrentView('chat')}
-          className={`mx-4 mb-6 flex items-center justify-center gap-2 py-2.5 rounded-xl font-medium transition-all shadow-sm ${
-            currentView === 'chat' 
-              ? 'bg-blue-600 hover:bg-blue-700 text-white' 
-              : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-50'
-          }`}
+          onClick={createNewSession}
+          className="mx-4 mb-6 flex items-center justify-center gap-2 py-2.5 rounded-xl font-medium transition-all shadow-sm bg-blue-600 hover:bg-blue-700 text-white"
         >
           <Plus size={18} /> New Chat
         </button>
 
-        <nav className="flex-1 overflow-y-auto px-2">
-          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2">Workspace</div>
+        <nav className="flex-1 overflow-y-auto px-2 flex flex-col">
           
+          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2">Recent Chats</div>
+          <div className="space-y-1 mb-6 flex-1 overflow-y-auto">
+            {sessions.map((session) => (
+              <div 
+                key={session.id}
+                onClick={() => loadSession(session.id)}
+                className={`flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-colors ${
+                  currentSessionId === session.id && currentView === 'chat'
+                    ? 'bg-blue-50 text-blue-700 font-medium' 
+                    : 'text-slate-600 hover:bg-slate-100'
+                }`}
+              >
+                <MessageSquare size={16} className="shrink-0 opacity-70" /> 
+                <span className="text-sm truncate">{session.title}</span>
+              </div>
+            ))}
+          </div>
+
+          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2">Workspace</div>
           <div 
             onClick={() => {
               setCurrentView('documents');
-              fetchDatabaseFiles(); // Trigger DB fetch on click
+              fetchDatabaseFiles(); 
             }}
-            className={`flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-colors ${
+            className={`flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-colors mb-2 ${
               currentView === 'documents' 
                 ? 'bg-blue-50 text-blue-600 font-medium' 
                 : 'text-slate-600 hover:bg-slate-100'
@@ -202,7 +323,8 @@ export default function SecureBrainDashboard() {
             <h2 className="font-semibold text-sm">
               {currentView === 'chat' ? 'Action-RAG SME Assistant' : 'Workspace / Legal Documents'}
             </h2>
-            {(isProcessing || isLoadingDb) && <Loader2 className="w-4 h-4 animate-spin text-blue-600" />}
+            {/* Added isLoadingHistory to the top right spinner as well */}
+            {(isProcessing || isLoadingDb || isLoadingHistory) && <Loader2 className="w-4 h-4 animate-spin text-blue-600" />}
           </div>
         </header>
 
@@ -210,50 +332,93 @@ export default function SecureBrainDashboard() {
         {currentView === 'chat' ? (
           <>
             <div className="flex-1 overflow-y-auto p-8 space-y-8">
-              {messages.length === 0 && (
+              
+              {/* --- LOADING HISTORY EFFECT --- */}
+              {isLoadingHistory ? (
+                 <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-4">
+                    <Loader2 size={40} className="animate-spin text-blue-500 opacity-80" />
+                    <p className="text-sm font-medium animate-pulse">Loading conversation history...</p>
+                 </div>
+              ) : messages.length === 0 ? (
                  <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-4">
                     <MessageSquare size={48} className="opacity-20" />
                     <p className="text-sm">Upload a document and ask a question to begin.</p>
                  </div>
-              )}
-              {messages.map((msg, idx) => (
-                <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'gap-4'}`}>
-                  {msg.role === 'ai' && (
-                    <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shrink-0">
-                      <span className="text-white text-xs font-bold">⚡</span>
-                    </div>
-                  )}
-                  <div className="flex-1 space-y-4 max-w-[80%]">
-                    <div className={`p-4 rounded-2xl text-sm leading-relaxed ${msg.role === 'user' ? 'bg-slate-800 text-white rounded-tr-none ml-auto' : 'bg-white border border-slate-100 shadow-sm'}`}>
-                      {msg.content}
-                    </div>
-
-                    {msg.role === 'ai' && msg.citations && msg.citations.length > 0 && (
-                      <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
-                        <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest flex items-center gap-2">
-                          <ExternalLink size={12} /> Source References
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          {msg.citations.map((cite, cIdx) => (
-                            <button 
-                              key={cIdx}
-                              onClick={() => setActiveDoc({ 
-                                title: cite.filename, 
-                                content: cite.content,
-                                fileUrl: getFileUrl(cite.filename)
-                              })}
-                              className="flex items-center gap-2 bg-white border border-slate-200 px-3 py-1.5 rounded-lg text-xs font-medium hover:border-blue-400 hover:text-blue-600 transition-colors shadow-sm"
-                            >
-                              <FileText size={14} className="text-blue-500" /> 
-                              {cite.filename}
-                            </button>
-                          ))}
-                        </div>
+              ) : (
+                messages.map((msg, idx) => (
+                  <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'gap-4'}`}>
+                    {(msg.role === 'ai' || msg.role === 'assistant') && (
+                      <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shrink-0 mt-1">
+                        <span className="text-white text-xs font-bold">⚡</span>
                       </div>
                     )}
+                    <div className="flex-1 space-y-4 max-w-[80%]">
+                      
+                      <div className={`p-4 rounded-2xl text-sm leading-relaxed ${msg.role === 'user' ? 'bg-slate-800 text-white rounded-tr-none ml-auto' : 'bg-white border border-slate-100 shadow-sm'}`}>
+                        {(msg.role === 'ai' || msg.role === 'assistant') ? (
+                          <div className="prose prose-sm prose-slate max-w-none">
+                            <ReactMarkdown
+                              components={{
+                                p: ({node, ...props}) => <p className="mb-2 last:mb-0" {...props} />,
+                                ul: ({node, ...props}) => <ul className="list-disc pl-4 mb-2 space-y-1" {...props} />,
+                                ol: ({node, ...props}) => <ol className="list-decimal pl-4 mb-2 space-y-1" {...props} />,
+                                li: ({node, ...props}) => <li className="marker:text-blue-500" {...props} />,
+                                strong: ({node, ...props}) => <strong className="font-semibold text-slate-900" {...props} />,
+                                h1: ({node, ...props}) => <h1 className="text-lg font-bold mb-2 mt-4" {...props} />,
+                                h2: ({node, ...props}) => <h2 className="text-md font-bold mb-2 mt-3" {...props} />,
+                                h3: ({node, ...props}) => <h3 className="text-sm font-bold mb-1 mt-2" {...props} />,
+                              }}
+                            >
+                              {msg.content}
+                            </ReactMarkdown>
+                          </div>
+                        ) : (
+                          <p>{msg.content}</p>
+                        )}
+                      </div>
+
+                      {(msg.role === 'ai' || msg.role === 'assistant') && msg.citations && msg.citations.length > 0 && (
+                        <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+                          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest flex items-center gap-2">
+                            <ExternalLink size={12} /> Source References
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            {msg.citations.map((cite, cIdx) => (
+                              <button 
+                                key={cIdx}
+                                onClick={() => setActiveDoc({ 
+                                  title: cite.filename, 
+                                  content: cite.content,
+                                  fileUrl: getFileUrl(cite.filename)
+                                })}
+                                className="flex items-center gap-2 bg-white border border-slate-200 px-3 py-1.5 rounded-lg text-xs font-medium hover:border-blue-400 hover:text-blue-600 transition-colors shadow-sm"
+                              >
+                                <FileText size={14} className="text-blue-500" /> 
+                                {cite.filename}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
+
+              {/* --- "AI IS THINKING" EFFECT --- */}
+              {isProcessing && !isLoadingHistory && (
+                <div className="flex gap-4">
+                  <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shrink-0 mt-1">
+                    <span className="text-white text-xs font-bold">⚡</span>
+                  </div>
+                  <div className="p-4 rounded-2xl text-sm leading-relaxed bg-white border border-slate-100 shadow-sm flex items-center gap-3 text-slate-500 max-w-[80%]">
+                    <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
+                    <span className="font-medium">Synthesizing answer from documents...</span>
                   </div>
                 </div>
-              ))}
+              )}
+              
+              <div ref={messagesEndRef} />
             </div>
 
             <div className="p-6 border-t border-slate-200 bg-white">
@@ -263,20 +428,25 @@ export default function SecureBrainDashboard() {
                   <Paperclip size={18} className="text-slate-400 cursor-pointer hover:text-slate-600" onClick={() => fileInputRef.current?.click()} />
                 </div>
                 <input 
-                  className="w-full bg-slate-50 border border-slate-200 rounded-2xl py-4 pl-12 pr-14 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 transition-all"
+                  className="w-full bg-slate-50 border border-slate-200 rounded-2xl py-4 pl-12 pr-14 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 transition-all disabled:opacity-50"
                   placeholder="Ask questions about company documents..."
                   value={inputText}
                   onChange={(e) => setInputText(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
+                  disabled={isProcessing || isLoadingHistory}
                 />
                 <div className="absolute right-3 top-1/2 -translate-y-1/2">
-                  <button onClick={handleSendMessage} className="bg-blue-600 p-2 rounded-xl text-white hover:bg-blue-700 shadow-md transition-colors" disabled={isProcessing}>
+                  <button 
+                    onClick={handleSendMessage} 
+                    className="bg-blue-600 p-2 rounded-xl text-white hover:bg-blue-700 shadow-md transition-colors disabled:opacity-50" 
+                    disabled={isProcessing || isLoadingHistory}
+                  >
                     <Send size={18} />
                   </button>
                 </div>
               </div>
             </div>
-          </  >
+          </>
         ) : (
           /* DOCUMENTS GRID VIEW */
           <div className="flex-1 overflow-y-auto p-8">
@@ -334,7 +504,7 @@ export default function SecureBrainDashboard() {
 
       {/* --- DOCUMENT VIEWER WITH NATIVE HIGHLIGHTING --- */}
       {activeDoc && (
-        <aside className="w-1/2 border-l border-slate-200 bg-slate-100 flex flex-col animate-in slide-in-from-right duration-300 shrink-0">
+        <aside className="w-1/2 border-l border-slate-200 bg-slate-100 flex flex-col animate-in slide-in-from-right duration-300 shrink-0 shadow-[-10px_0_30px_rgba(0,0,0,0.05)] z-10">
           <header className="h-14 border-b border-slate-200 bg-white flex items-center justify-between px-4 shrink-0">
             <div className="flex items-center gap-3">
               <div className="bg-red-50 p-1.5 rounded">

@@ -47,9 +47,12 @@ async def upload_document(
         }
         
     except FileExistsError as fee:
-        # Catch our duplicate shield from earlier
         raise HTTPException(status_code=409, detail=str(fee))
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
+        # 🐛 ADD THESE TWO LINES TO REVEAL THE HIDDEN ERROR
+        import traceback
+        traceback.print_exc() 
+        
         raise HTTPException(status_code=500, detail=str(e))
