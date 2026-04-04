@@ -1,58 +1,73 @@
+"""
+Upload API — stream-hashed file uploads to prevent memory spikes.
+"""
 import os
-from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
+import hashlib
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks
 from app.services.ingestion_service import IngestionService
 from app.core.dependencies import get_ingestion_service
+from app.core.logger import logger
 
-router = APIRouter(prefix="/api/v1/upload", tags=["Document Ingestion"])
+router = APIRouter(prefix="/api/v1/upload", tags=["Document Management"])
 
-# 🛡️ THE NEW SHIELD: Only allow specific file structures
-ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
+TEMP_DIR = "/tmp/actionrag_uploads"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# 64KB chunks for stream hashing
+HASH_CHUNK_SIZE = 65536
+
 
 @router.post("/")
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     tenant_id: str = Form(...),
-    ingestion_service: IngestionService = Depends(get_ingestion_service)
+    ingestion_service: IngestionService = Depends(get_ingestion_service),
 ):
-    # 1. Ensure the file actually has a name
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file provided.")
-
-    # 2. Extract the file extension and make it lowercase
-    _, file_extension = os.path.splitext(file.filename.lower())
-
-    # 3. 🛡️ FAIL FAST: Check the file structure
-    if file_extension not in ALLOWED_EXTENSIONS:
-        # 415 is the official HTTP status code for "Unsupported Media Type"
-        raise HTTPException(
-            status_code=415, 
-            detail="File structure is not supported. Please upload PDF, DOCX, or TXT files."
-        )
-
     try:
-        # Read the file into memory
-        file_bytes = await file.read()
-        
-        # Send it to the engine
-        chunks_saved = ingestion_service.process_file(
-            file_bytes=file_bytes, 
-            filename=file.filename, 
-            tenant_id=tenant_id
+        # 1. Stream-hash: compute SHA-256 WITHOUT loading entire file into memory
+        sha256 = hashlib.sha256()
+        safe_ext = os.path.splitext(file.filename)[1]
+
+        # Write to a temp file AND hash simultaneously
+        temp_path = os.path.join(TEMP_DIR, f"uploading_{file.filename}")
+        with open(temp_path, "wb") as f:
+            while True:
+                chunk = await file.read(HASH_CHUNK_SIZE)
+                if not chunk:
+                    break
+                sha256.update(chunk)
+                f.write(chunk)
+
+        file_hash = sha256.hexdigest()
+
+        # 2. Check Database for this exact fingerprint
+        if ingestion_service.db.document_exists(file_hash=file_hash, tenant_id=tenant_id):
+            os.remove(temp_path)  # Clean up temp file
+            raise HTTPException(status_code=409, detail="Exact file content already exists. Duplicate rejected.")
+
+        # 3. Rename temp file to hash-based filename
+        file_path = os.path.join(TEMP_DIR, f"{file_hash}{safe_ext}")
+        os.rename(temp_path, file_path)
+
+        # 4. Fire and Forget: Send to the Background Worker
+        background_tasks.add_task(
+            ingestion_service.process_file_background,
+            file_path=file_path,
+            filename=file.filename,
+            file_hash=file_hash,
+            tenant_id=tenant_id,
         )
-        
+
+        logger.info(f"Upload accepted: '{file.filename}' (hash={file_hash[:12]}...)")
+
+        # 5. Instantly return success to the frontend
         return {
-            "status": "success", 
-            "message": f"Successfully processed and embedded {chunks_saved} chunks.",
-            "filename": file.filename
+            "status": "processing",
+            "message": f"'{file.filename}' is processing in the background.",
         }
-        
-    except FileExistsError as fee:
-        raise HTTPException(status_code=409, detail=str(fee))
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
     except Exception as e:
-        # 🐛 ADD THESE TWO LINES TO REVEAL THE HIDDEN ERROR
-        import traceback
-        traceback.print_exc() 
-        
+        logger.error(f"Upload failed for '{file.filename}': {e}")
         raise HTTPException(status_code=500, detail=str(e))

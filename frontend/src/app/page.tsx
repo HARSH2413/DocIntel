@@ -1,545 +1,541 @@
 "use client";
 
-import React, { useState, useRef, useEffect } from 'react';
-import { 
-  MessageSquare, Plus, FileText, Settings, HelpCircle, 
-  Share2, ChevronRight, Send, Paperclip, MoreVertical, 
-  Maximize2, X, ExternalLink, Loader2, Info, Database,
-  CheckCircle2, AlertCircle
-} from 'lucide-react';
-// Import React Markdown
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
+import {
+  MessageSquare, Plus, FileText, Send, Paperclip, X,
+  Loader2, Info, Database, History, CheckCircle2,
+  AlertCircle, RefreshCw, XCircle, Cloud
+} from 'lucide-react';
+import { API_URL } from '../lib/config';
 
-// --- Types for Backend Integration ---
+// ── Types ──
+
 interface Citation {
   filename: string;
   content: string;
-  similarity: number; 
+  similarity: number;
 }
 
 interface ChatMessage {
-  role: 'user' | 'ai' | 'assistant'; 
+  role: 'user' | 'ai';
   content: string;
   citations?: Citation[];
+  key_takeaways?: string[];
+  related_questions?: string[];
+  error?: boolean;
 }
 
-interface ChatSession {
-  id: string;
-  title: string;
+interface Toast {
+  id: number;
+  message: string;
+  type: 'success' | 'error' | 'warning';
 }
+
+// ── Inline Toast Component ──
+
+function ToastContainer({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: number) => void }) {
+  return (
+    <div className="fixed top-6 right-6 z-50 space-y-3">
+      {toasts.map((toast) => (
+        <div
+          key={toast.id}
+          className={`flex items-center gap-3 px-5 py-3.5 rounded-2xl shadow-2xl text-sm font-semibold backdrop-blur-md animate-slide-in max-w-sm ${toast.type === 'success' ? 'bg-emerald-600/95 text-white' :
+            toast.type === 'error' ? 'bg-red-600/95 text-white' :
+              'bg-amber-500/95 text-white'
+            }`}
+        >
+          {toast.type === 'success' && <CheckCircle2 size={16} />}
+          {toast.type === 'error' && <XCircle size={16} />}
+          {toast.type === 'warning' && <AlertCircle size={16} />}
+          <span className="flex-1">{toast.message}</span>
+          <button onClick={() => onDismiss(toast.id)} className="opacity-70 hover:opacity-100">
+            <X size={14} />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Knowledge Base View Component ──
+// NOTE: For maintainability, this would typically be in its own file (e.g., `components/KnowledgeBaseView.tsx`)
+function KnowledgeBaseView({
+  dbFiles,
+  isSyncing,
+  isUploading,
+  onUploadClick,
+  onDriveSync,
+  onForceResync,
+  onDeleteFile,
+}: {
+  dbFiles: string[];
+  isSyncing: boolean;
+  isUploading: boolean;
+  onUploadClick: () => void;
+  onDriveSync: () => void;
+  onForceResync: () => void;
+  onDeleteFile: (filename: string) => void;
+}) {
+  return (
+    <div className="p-10 bg-slate-50 flex-1 overflow-y-auto">
+      <div className="flex items-center justify-between mb-6">
+        <h2 className="text-2xl font-bold text-slate-800">Knowledge Base</h2>
+        <div className="flex gap-3">
+          <button onClick={onForceResync} disabled={isSyncing} className="flex items-center gap-2 px-4 py-2 bg-amber-500 text-white text-sm font-bold rounded-xl hover:bg-amber-600 transition-all disabled:opacity-50 shadow-md shadow-amber-100">
+            {isSyncing ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+            Force Re-sync
+          </button>
+          <button onClick={onDriveSync} disabled={isSyncing} className="flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white text-sm font-bold rounded-xl hover:bg-emerald-700 transition-all disabled:opacity-50 shadow-md shadow-emerald-100">
+            {isSyncing ? <Loader2 size={14} className="animate-spin" /> : <Cloud size={14} />}
+            Sync Drive
+          </button>
+          <button onClick={onUploadClick} disabled={isUploading} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 transition-all disabled:opacity-50 shadow-md shadow-indigo-100">
+            {isUploading ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
+            Upload Document
+          </button>
+        </div>
+      </div>
+      {dbFiles.length === 0 ? (
+        <div className="text-center p-12 border-2 border-dashed border-slate-200 rounded-3xl text-slate-500">
+          <Database size={40} className="mx-auto mb-4 opacity-20" />
+          <p>No documents found in the current tenant space.</p>
+          <p className="text-xs mt-2">Upload a file in the chat to see it here.</p>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {dbFiles.map((file, i) => (
+            <div key={i} className="p-6 bg-white border border-slate-200 rounded-3xl hover:border-indigo-500 hover:shadow-xl transition-all group flex flex-col justify-between h-32 relative">
+              <div className="flex items-start justify-between">
+                <FileText className="text-indigo-600 group-hover:scale-110 transition-transform" size={28} />
+                <button onClick={(e) => { e.stopPropagation(); onDeleteFile(file); }} className="opacity-0 group-hover:opacity-100 p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all">
+                  <X size={14} />
+                </button>
+              </div>
+              <div>
+                <h4 className="font-bold text-sm truncate text-slate-800">{file}</h4>
+                <p className="text-[10px] text-emerald-600 font-bold mt-1 uppercase tracking-tighter flex items-center gap-1">
+                  <CheckCircle2 size={10} /> Verified in DB
+                </p>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Main Dashboard ──
 
 export default function SecureBrainDashboard() {
-  // --- UI State ---
-  const [activeDoc, setActiveDoc] = useState<{title: string, content: string, fileUrl?: string} | null>(null);
+  const [activeDoc, setActiveDoc] = useState<{ title: string, content: string, fileUrl?: string } | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputText, setInputText] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [currentView, setCurrentView] = useState<'chat' | 'documents'>('chat');
-  
-  const [toast, setToast] = useState<{message: string, type: 'success' | 'error'} | null>(null);
-
-  const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
-  
   const [localFiles, setLocalFiles] = useState<Record<string, string>>({});
   const [dbFiles, setDbFiles] = useState<string[]>([]);
-  const [isLoadingDb, setIsLoadingDb] = useState(false);
-  
-  // NEW: State to track if history is currently loading
-  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
-  
-  // --- Refs & Config ---
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null); 
-  const tenantId = "a4e69a0a-c349-4dd8-a923-e7c1ce02f0e6"; 
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [recentChats, setRecentChats] = useState<{ id: string, title: string }[]>([]);
+  const [toasts, setToasts] = useState<Toast[]>([]);
 
-  // --- Initialize & Local Storage ---
-  useEffect(() => {
-    const savedSessions = localStorage.getItem(`sessions_${tenantId}`);
-    if (savedSessions) {
-      const parsed = JSON.parse(savedSessions);
-      setSessions(parsed);
-      if (parsed.length > 0) {
-        loadSession(parsed[0].id);
-      }
-    } else {
-      createNewSession();
-    }
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // FIXME: The tenantId is hardcoded. In a real application, this should be
+  // derived from the user's session or an authentication context provider.
+  // For example: `const { tenantId } = useAuth();`
+  const tenantId = "a4e69a0a-c349-4dd8-a923-e7c1ce02f0e6";
+
+  const showToast = useCallback((message: string, type: 'success' | 'error' | 'warning') => {
+    const id = Date.now();
+    setToasts(prev => [...prev, { id, message, type }]);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 4000);
   }, []);
 
-  useEffect(() => {
-    if (sessions.length > 0) {
-      localStorage.setItem(`sessions_${tenantId}`, JSON.stringify(sessions));
-    }
-  }, [sessions]);
+  const dismissToast = useCallback((id: number) => {
+    setToasts(prev => prev.filter(t => t.id !== id));
+  }, []);
 
-  // Auto-scroll Effect
-  const scrollToBottom = () => {
+  const apiFetch = useCallback(async (path: string, options?: RequestInit) => {
+    const res = await fetch(`${API_URL}${path}`, options);
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({ detail: "Unknown error" }));
+      if (res.status === 429) {
+        showToast("Rate limited — please wait a moment and try again", "warning");
+        throw new Error("rate_limited");
+      }
+      if (res.status === 409) {
+        showToast(data.detail || "Duplicate file detected", "warning");
+        throw new Error("duplicate");
+      }
+      showToast(data.detail || "Something went wrong", "error");
+      throw new Error(data.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  }, [showToast]);
+
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
+  }, [messages]);
 
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, isProcessing, isLoadingHistory]);
-
-  // --- Backend Actions ---
-
-  const showToast = (message: string, type: 'success' | 'error') => {
-    setToast({ message, type });
-    setTimeout(() => setToast(null), 4000); 
-  };
-
-  const createNewSession = async () => {
-    try {
-      const response = await fetch("http://localhost:8000/api/v1/chat/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tenant_id: tenantId, title: "New Conversation" })
-      });
-      if (response.ok) {
-        const data = await response.json();
-        const newSession = { id: data.session_id, title: "New Conversation" };
-        setSessions(prev => [newSession, ...prev]);
-        setCurrentSessionId(newSession.id);
-        setMessages([]);
-        setCurrentView('chat');
+    const fetchDocs = async () => {
+      try {
+        const data = await apiFetch(`/api/v1/documents/?tenant_id=${tenantId}`);
+        if (data.files) setDbFiles(data.files);
+      } catch {
+        // Silent fail
       }
-    } catch (err) {
-      console.error("Failed to create session", err);
-    }
-  };
+    };
+    fetchDocs();
+  }, [apiFetch, tenantId]);
 
-  const loadSession = async (sessionId: string) => {
-    setCurrentSessionId(sessionId);
-    setCurrentView('chat');
-    setActiveDoc(null);
-    setMessages([]);
-    setIsLoadingHistory(true); // START LOADING EFFECT
-    
-    try {
-      const response = await fetch(`http://localhost:8000/api/v1/chat/sessions/${sessionId}`);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.history) setMessages(data.history);
+  useEffect(() => {
+    if (!sessionId) return;
+    const loadHistory = async () => {
+      try {
+        const data = await apiFetch(`/api/v1/chat/sessions/${sessionId}`);
+        setMessages(data.history.map((m: { role: string; content: string }) => ({
+          role: m.role === 'assistant' ? 'ai' : 'user',
+          content: m.content
+        })));
+      } catch {
+        showToast("Failed to load chat history", "error");
       }
-    } catch (err) {
-      console.error("Failed to load history", err);
-      showToast("Failed to load chat history.", "error");
-    } finally {
-      setIsLoadingHistory(false); // STOP LOADING EFFECT
-    }
-  };
+    };
+    loadHistory();
+  }, [sessionId, apiFetch, showToast]);
 
-  const fetchDatabaseFiles = async () => {
-    setIsLoadingDb(true);
-    try {
-      const response = await fetch(`http://localhost:8000/api/v1/documents/?tenant_id=${tenantId}`);
-      if (response.ok) {
-        const data = await response.json();
-        setDbFiles(data.files);
-      }
-    } catch (err) {
-      console.error("Failed to fetch documents from database", err);
-    } finally {
-      setIsLoadingDb(false);
-    }
-  };
-
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
     if (!file) return;
 
-    setIsProcessing(true);
-    const fileUrl = URL.createObjectURL(file);
-    const safeKey = file.name.toLowerCase();
-    
-    setLocalFiles(prev => ({ ...prev, [file.name]: fileUrl }));
-
+    setIsUploading(true);
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("tenant_id", tenantId); 
+    formData.append("tenant_id", tenantId);
 
     try {
-      const response = await fetch("http://localhost:8000/api/v1/upload/", {
+      const data = await apiFetch("/api/v1/upload/", { method: "POST", body: formData });
+      showToast(`${data.message}`, "success");
+      setDbFiles(prev => Array.from(new Set([...prev, file.name])));
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message === "rate_limited") return;
+      if (err instanceof Error && err.message === "duplicate") return;
+    } finally {
+      setIsUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const handleDriveSync = async (forceResync: boolean = false) => {
+    setIsSyncing(true);
+    const formData = new FormData();
+    formData.append("tenant_id", tenantId);
+    if (forceResync) {
+      formData.append("force_resync", "true");
+    }
+
+    try {
+      showToast(forceResync ? "Force re-syncing all files..." : "Scanning Google Drive folder...", "warning");
+      const data = await apiFetch("/api/v1/drive/sync", {
         method: "POST",
         body: formData,
       });
-
-      if (response.ok) {
-        showToast(`${file.name} successfully uploaded and indexed!`, 'success');
-        if (currentView === 'documents') fetchDatabaseFiles();
-      } else {
-        const error = await response.json();
-        showToast(`Upload Error: ${error.detail}`, 'error');
+      showToast(data.message, "success");
+      if (data.queued_files && data.queued_files.length > 0) {
+        setDbFiles(prev => Array.from(new Set([...prev, ...data.queued_files])));
       }
     } catch (err) {
-      showToast("Network error during upload.", 'error');
+      // Errors handled by apiFetch
     } finally {
-      setIsProcessing(false);
-      if (fileInputRef.current) fileInputRef.current.value = ''; 
+      setIsSyncing(false);
     }
   };
 
-  const handleSendMessage = async () => {
-    if (!inputText.trim() || isProcessing) return;
+  const handleSendMessage = async (retryContent?: string) => {
+    const userQuery = retryContent || inputText.trim();
+    if (!userQuery || isProcessing) return;
 
-    let activeSession = currentSessionId;
-    if (!activeSession) {
-       await createNewSession();
-       activeSession = currentSessionId; 
+    if (!retryContent) {
+      setInputText("");
+      setMessages(prev => [...prev, { role: 'user', content: userQuery }]);
     }
-
-    const userQuery = inputText;
-    setInputText("");
-    setMessages(prev => [...prev, { role: 'user', content: userQuery }]);
     setIsProcessing(true);
 
-    if (messages.length === 0 && activeSession) {
-       setSessions(prev => prev.map(s => s.id === activeSession ? { ...s, title: userQuery.substring(0, 30) + '...' } : s));
+    let currentSid = sessionId;
+    if (!currentSid) {
+      try {
+        const data = await apiFetch("/api/v1/chat/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tenant_id: tenantId, title: userQuery.slice(0, 30) })
+        });
+        currentSid = data.session_id;
+        setSessionId(currentSid);
+        setRecentChats(prev => [{ id: data.session_id, title: userQuery.slice(0, 25) + "..." }, ...prev]);
+      } catch {
+        showToast("Failed to create chat session", "error");
+        setIsProcessing(false);
+        return;
+      }
     }
 
     try {
-      const response = await fetch("http://localhost:8000/api/v1/chat/", {
+      const data = await apiFetch("/api/v1/chat/", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question: userQuery,
-          tenant_id: tenantId,
-          session_id: activeSession
-        }),
+        body: JSON.stringify({ question: userQuery, tenant_id: tenantId, session_id: currentSid })
       });
-
-      if (response.ok) {
-        const data = await response.json(); 
-        setMessages(prev => [...prev, { 
-          role: 'ai', 
-          content: data.answer, 
-          citations: data.citations 
-        }]);
-      } else if (response.status === 429) {
-        showToast("Rate limit exceeded. Please wait a moment.", "error");
-      }
-    } catch (err) {
-      showToast("Failed to connect to AI engine.", "error");
+      setMessages(prev => {
+        const filtered = retryContent ? prev.filter(m => !(m.error && m.role === 'ai')) : prev;
+        return [...filtered, { role: 'ai', content: data.answer, citations: data.citations }];
+      });
+    } catch {
+      setMessages(prev => [...prev, { role: 'ai', content: "I couldn't reach the server. Click retry or try again in a moment.", error: true }]);
     } finally {
       setIsProcessing(false);
     }
   };
 
-  const getSearchQuery = (content: string) => {
-    if (!content) return "";
-    const cleanText = content.replace(/[^\w\s]/gi, ' ').replace(/\s+/g, ' ').trim();
-    const searchWords = cleanText.split(' ').slice(0, 4).join(' ');
-    return encodeURIComponent(`"${searchWords}"`);
+  const handleDeleteFile = async (filename: string) => {
+    try {
+      await apiFetch(`/api/v1/documents/?filename=${encodeURIComponent(filename)}&tenant_id=${tenantId}`, { method: "DELETE" });
+      setDbFiles(prev => prev.filter(f => f !== filename));
+      showToast(`Deleted "${filename}"`, "success");
+    } catch { }
   };
 
-  const getFileUrl = (filename: string) => {
-    const safeName = filename.toLowerCase();
-    const foundKey = Object.keys(localFiles).find(k => k.toLowerCase() === safeName);
-    return foundKey ? localFiles[foundKey] : undefined;
+  const getFileUrl = (name: string) => {
+    const key = Object.keys(localFiles).find(k => k.toLowerCase() === name.toLowerCase());
+    return key ? localFiles[key] : undefined;
   };
-
-  const allUniqueFiles = Array.from(new Set([...dbFiles, ...Object.keys(localFiles)]));
 
   return (
-    <div className="flex h-screen bg-white font-sans text-slate-800 overflow-hidden relative">
-      
-      {/* --- TOAST NOTIFICATION --- */}
-      {toast && (
-        <div className={`fixed bottom-6 right-6 z-50 flex items-center gap-3 px-5 py-3.5 rounded-xl shadow-2xl font-medium animate-in slide-in-from-bottom-5 duration-300 ${toast.type === 'success' ? 'bg-slate-800 text-white' : 'bg-red-50 text-red-600 border border-red-200'}`}>
-          {toast.type === 'success' ? <CheckCircle2 size={18} className="text-green-400" /> : <AlertCircle size={18} />}
-          <span className="text-sm">{toast.message}</span>
-        </div>
-      )}
+    <div className="flex h-screen bg-[#F8FAFC] font-sans text-slate-900 overflow-hidden">
+      <ToastContainer toasts={toasts} onDismiss={dismissToast} />
 
-      {/* --- SIDEBAR --- */}
-      <aside className="w-64 border-r border-slate-200 flex flex-col bg-slate-50/50 shrink-0">
-        <div className="p-4 flex items-center gap-2 mb-4">
-          <div className="bg-blue-600 p-1.5 rounded-lg">
-            <MessageSquare className="text-white w-5 h-5" />
+      <aside className="w-72 border-r border-slate-200 flex flex-col bg-white shrink-0">
+        <div className="p-6 flex items-center gap-3">
+          <div className="bg-indigo-600 p-2 rounded-xl shadow-lg shadow-indigo-100">
+            <Database className="text-white w-5 h-5" />
           </div>
-          <span className="font-bold text-lg tracking-tight">SECURE BRAIN</span>
+          <span className="font-bold text-xl tracking-tight text-slate-800">ActionRAG</span>
         </div>
 
-        <button 
-          onClick={createNewSession}
-          className="mx-4 mb-6 flex items-center justify-center gap-2 py-2.5 rounded-xl font-medium transition-all shadow-sm bg-blue-600 hover:bg-blue-700 text-white"
-        >
-          <Plus size={18} /> New Chat
+        <button onClick={() => { setMessages([]); setSessionId(null); setCurrentView('chat'); }} className="mx-6 mb-8 flex items-center justify-center gap-2 py-3 rounded-xl font-bold transition-all bg-indigo-600 hover:bg-indigo-700 text-white shadow-md shadow-indigo-100">
+          <Plus size={18} /> New Investigation
         </button>
 
-        <nav className="flex-1 overflow-y-auto px-2 flex flex-col">
-          
-          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2">Recent Chats</div>
-          <div className="space-y-1 mb-6 flex-1 overflow-y-auto">
-            {sessions.map((session) => (
-              <div 
-                key={session.id}
-                onClick={() => loadSession(session.id)}
-                className={`flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-colors ${
-                  currentSessionId === session.id && currentView === 'chat'
-                    ? 'bg-blue-50 text-blue-700 font-medium' 
-                    : 'text-slate-600 hover:bg-slate-100'
-                }`}
-              >
-                <MessageSquare size={16} className="shrink-0 opacity-70" /> 
-                <span className="text-sm truncate">{session.title}</span>
-              </div>
-            ))}
-          </div>
-
-          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2">Workspace</div>
-          <div 
-            onClick={() => {
-              setCurrentView('documents');
-              fetchDatabaseFiles(); 
-            }}
-            className={`flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-colors mb-2 ${
-              currentView === 'documents' 
-                ? 'bg-blue-50 text-blue-600 font-medium' 
-                : 'text-slate-600 hover:bg-slate-100'
-            }`}
-          >
-            <Database size={16} /> <span className="text-sm">Legal Documents</span>
-          </div>
-        </nav>
-
-        <div className="p-4 border-t border-slate-200">
-          <div className="flex items-center gap-3 p-2 bg-slate-100 rounded-xl">
-            <div className="w-8 h-8 bg-orange-200 rounded-lg flex items-center justify-center text-orange-700 font-bold text-xs">AM</div>
-            <div className="flex-1 overflow-hidden">
-              <div className="text-xs font-bold truncate">Alex Morgan</div>
-              <div className="text-[10px] text-slate-500 truncate" title={tenantId}>Tenant Active</div>
+        <nav className="flex-1 overflow-y-auto px-4 space-y-8">
+          <div>
+            <h3 className="text-[11px] font-bold text-slate-400 uppercase tracking-[0.2em] px-2 mb-3">Library</h3>
+            <div onClick={() => setCurrentView('documents')} className={`flex items-center gap-3 px-3 py-2.5 rounded-xl cursor-pointer transition-all ${currentView === 'documents' ? 'bg-indigo-50 text-indigo-700 font-bold' : 'text-slate-500 hover:bg-slate-50'}`}>
+              <FileText size={18} /> <span className="text-sm">Knowledge Base</span>
             </div>
           </div>
-        </div>
+
+          {recentChats.length > 0 && (
+            <div>
+              <h3 className="text-[11px] font-bold text-slate-400 uppercase tracking-[0.2em] px-2 mb-3">Recent Inquiries</h3>
+              <div className="space-y-1">
+                {recentChats.map((chat) => (
+                  <div key={chat.id} onClick={() => { setSessionId(chat.id); setCurrentView('chat'); }} className={`flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer text-xs truncate transition-all ${sessionId === chat.id ? 'bg-slate-100 text-indigo-600 font-bold border-l-4 border-indigo-600 rounded-l-none' : 'text-slate-500 hover:bg-slate-50'}`}>
+                    <History size={14} /> {chat.title}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </nav>
       </aside>
 
-      {/* --- MAIN AREA --- */}
-      <main className={`flex-1 flex flex-col min-w-0 bg-slate-50/30 transition-all duration-300 ${activeDoc ? 'max-w-[50%]' : 'max-w-full'}`}>
-        
-        <header className="h-14 border-b border-slate-200 flex items-center justify-between px-6 bg-white shrink-0">
-          <div className="flex items-center gap-3">
-            <h2 className="font-semibold text-sm">
-              {currentView === 'chat' ? 'Action-RAG SME Assistant' : 'Workspace / Legal Documents'}
+      <main className={`flex-1 flex flex-col min-w-0 bg-white transition-all duration-500 ease-in-out ${activeDoc ? 'max-w-[50%] border-r border-slate-200' : 'max-w-full'}`}>
+        <header className="h-16 border-b border-slate-100 flex items-center justify-between px-8 shrink-0 bg-white/80 backdrop-blur-md sticky top-0 z-10">
+          <div className="flex items-center gap-2">
+            <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+            <h2 className="font-bold text-sm text-slate-700 uppercase tracking-widest">
+              {currentView === 'chat' ? 'Neural Search Active' : 'Document Index'}
             </h2>
-            {/* Added isLoadingHistory to the top right spinner as well */}
-            {(isProcessing || isLoadingDb || isLoadingHistory) && <Loader2 className="w-4 h-4 animate-spin text-blue-600" />}
+          </div>
+          <div className="flex items-center gap-3">
+            {isSyncing && <span className="text-xs text-emerald-600 font-bold flex items-center gap-2"><Loader2 className="w-3 h-3 animate-spin" /> Syncing Drive...</span>}
+            {isUploading && <span className="text-xs text-indigo-600 font-bold flex items-center gap-2"><Loader2 className="w-3 h-3 animate-spin" /> Indexing Document...</span>}
+            {isProcessing && <Loader2 className="w-4 h-4 animate-spin text-indigo-600" />}
           </div>
         </header>
 
-        {/* --- DYNAMIC CONTENT: CHAT vs DOCUMENTS --- */}
         {currentView === 'chat' ? (
           <>
-            <div className="flex-1 overflow-y-auto p-8 space-y-8">
-              
-              {/* --- LOADING HISTORY EFFECT --- */}
-              {isLoadingHistory ? (
-                 <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-4">
-                    <Loader2 size={40} className="animate-spin text-blue-500 opacity-80" />
-                    <p className="text-sm font-medium animate-pulse">Loading conversation history...</p>
-                 </div>
-              ) : messages.length === 0 ? (
-                 <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-4">
-                    <MessageSquare size={48} className="opacity-20" />
-                    <p className="text-sm">Upload a document and ask a question to begin.</p>
-                 </div>
-              ) : (
-                messages.map((msg, idx) => (
-                  <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'gap-4'}`}>
-                    {(msg.role === 'ai' || msg.role === 'assistant') && (
-                      <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shrink-0 mt-1">
-                        <span className="text-white text-xs font-bold">⚡</span>
-                      </div>
-                    )}
-                    <div className="flex-1 space-y-4 max-w-[80%]">
-                      
-                      <div className={`p-4 rounded-2xl text-sm leading-relaxed ${msg.role === 'user' ? 'bg-slate-800 text-white rounded-tr-none ml-auto' : 'bg-white border border-slate-100 shadow-sm'}`}>
-                        {(msg.role === 'ai' || msg.role === 'assistant') ? (
-                          <div className="prose prose-sm prose-slate max-w-none">
-                            <ReactMarkdown
-                              components={{
-                                p: ({node, ...props}) => <p className="mb-2 last:mb-0" {...props} />,
-                                ul: ({node, ...props}) => <ul className="list-disc pl-4 mb-2 space-y-1" {...props} />,
-                                ol: ({node, ...props}) => <ol className="list-decimal pl-4 mb-2 space-y-1" {...props} />,
-                                li: ({node, ...props}) => <li className="marker:text-blue-500" {...props} />,
-                                strong: ({node, ...props}) => <strong className="font-semibold text-slate-900" {...props} />,
-                                h1: ({node, ...props}) => <h1 className="text-lg font-bold mb-2 mt-4" {...props} />,
-                                h2: ({node, ...props}) => <h2 className="text-md font-bold mb-2 mt-3" {...props} />,
-                                h3: ({node, ...props}) => <h3 className="text-sm font-bold mb-1 mt-2" {...props} />,
-                              }}
-                            >
-                              {msg.content}
-                            </ReactMarkdown>
-                          </div>
-                        ) : (
-                          <p>{msg.content}</p>
-                        )}
-                      </div>
-
-                      {(msg.role === 'ai' || msg.role === 'assistant') && msg.citations && msg.citations.length > 0 && (
-                        <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
-                          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest flex items-center gap-2">
-                            <ExternalLink size={12} /> Source References
-                          </div>
-                          <div className="flex flex-wrap gap-2">
-                            {msg.citations.map((cite, cIdx) => (
-                              <button 
-                                key={cIdx}
-                                onClick={() => setActiveDoc({ 
-                                  title: cite.filename, 
-                                  content: cite.content,
-                                  fileUrl: getFileUrl(cite.filename)
-                                })}
-                                className="flex items-center gap-2 bg-white border border-slate-200 px-3 py-1.5 rounded-lg text-xs font-medium hover:border-blue-400 hover:text-blue-600 transition-colors shadow-sm"
-                              >
-                                <FileText size={14} className="text-blue-500" /> 
-                                {cite.filename}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                    </div>
+            <div className="flex-1 overflow-y-auto p-10 space-y-10 scroll-smooth bg-slate-50">
+              {messages.length === 0 && (
+                <div className="h-full flex flex-col items-center justify-center text-center space-y-6">
+                  <div className="w-20 h-20 bg-indigo-50 rounded-3xl flex items-center justify-center">
+                    <MessageSquare size={40} className="text-indigo-600 opacity-40" />
                   </div>
-                ))
-              )}
-
-              {/* --- "AI IS THINKING" EFFECT --- */}
-              {isProcessing && !isLoadingHistory && (
-                <div className="flex gap-4">
-                  <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shrink-0 mt-1">
-                    <span className="text-white text-xs font-bold">⚡</span>
-                  </div>
-                  <div className="p-4 rounded-2xl text-sm leading-relaxed bg-white border border-slate-100 shadow-sm flex items-center gap-3 text-slate-500 max-w-[80%]">
-                    <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
-                    <span className="font-medium">Synthesizing answer from documents...</span>
+                  <div className="space-y-2">
+                    <h3 className="text-xl font-bold text-slate-800">Enterprise Contextual AI</h3>
+                    <p className="text-sm text-slate-400 max-w-sm">Ask a question to retrieve insights from your uploaded technical or legal documentation.</p>
                   </div>
                 </div>
               )}
-              
+              {messages.map((msg, idx) => (
+                <div key={idx} className={`flex w-full ${msg.role === 'user' ? 'justify-end' : 'justify-start gap-4'}`}>
+
+                  {msg.role === 'ai' && (
+                    <div className={`w-10 h-10 rounded-2xl flex items-center justify-center shrink-0 shadow-lg mt-1 ${msg.error ? 'bg-red-500 shadow-red-100' : 'bg-indigo-600 shadow-indigo-100'
+                      }`}>
+                      {msg.error ? <AlertCircle className="text-white w-4 h-4" /> : <span className="text-white text-xs font-black italic">AI</span>}
+                    </div>
+                  )}
+
+                  <div className={`flex flex-col space-y-3 max-w-[85%] ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
+                    {msg.role === 'ai' && !msg.error && msg.key_takeaways && msg.key_takeaways.length > 0 && (
+                      <div className="w-full bg-amber-50 border-l-4 border-amber-400 p-4 rounded-lg animate-in fade-in">
+                        <p className="text-xs font-bold text-amber-900 uppercase tracking-wide mb-2.5 flex items-center gap-2">
+                          <span className="text-lg">📌</span> Key Takeaways
+                        </p>
+                        <ul className="text-sm text-amber-800 space-y-1.5">
+                          {msg.key_takeaways.map((point, pIdx) => (
+                            <li key={pIdx} className="flex items-start gap-2">
+                              <span className="text-amber-400 font-bold mt-0.5">•</span>
+                              <span className="leading-relaxed">{point}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    <div className={`p-6 text-[15px] leading-relaxed shadow-sm transition-all ${msg.role === 'user'
+                      ? 'bg-slate-900 text-white rounded-3xl rounded-tr-sm'
+                      : msg.error
+                        ? 'bg-red-50 border border-red-200 text-red-700 rounded-3xl rounded-tl-sm'
+                        : 'bg-white border border-slate-200 text-slate-800 rounded-3xl rounded-tl-sm'
+                      }`}>
+                      <div className={`prose prose-sm max-w-none ${msg.role === 'user' ? 'prose-invert' : msg.error ? '' : 'prose-indigo'}`}>
+                        <ReactMarkdown>
+                          {msg.content}
+                        </ReactMarkdown>
+                      </div>
+
+                      {msg.error && (
+                        <button onClick={() => { const lastUserMsg = messages.slice(0, idx).reverse().find(m => m.role === 'user'); if (lastUserMsg) handleSendMessage(lastUserMsg.content); }} className="mt-3 flex items-center gap-2 text-xs font-bold text-red-600 hover:text-red-800 transition-colors">
+                          <RefreshCw size={12} /> Retry
+                        </button>
+                      )}
+                    </div>
+
+                    {msg.role === 'ai' && !msg.error && msg.citations && msg.citations.length > 0 && (
+                      <div className="flex flex-wrap gap-2 animate-in fade-in pt-1 pl-2">
+                        {Array.from(new Set(msg.citations.map(c => c.filename))).map((filename, cIdx) => (
+                          <button key={cIdx} onClick={() => { const cite = msg.citations?.find(c => c.filename === filename); setActiveDoc({ title: filename, content: cite?.content || "", fileUrl: getFileUrl(filename) }); }} className="group flex items-center gap-1.5 bg-indigo-50 border border-indigo-100 px-3 py-1.5 rounded-full text-[11px] font-bold text-indigo-700 hover:bg-indigo-600 hover:text-white transition-all duration-200">
+                            <CheckCircle2 size={12} className="text-indigo-400 group-hover:text-white" />
+                            {filename}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    {msg.role === 'ai' && !msg.error && msg.related_questions && msg.related_questions.length > 0 && (
+                      <div className="w-full mt-3 pt-3 border-t border-slate-200">
+                        <p className="text-xs font-bold text-slate-600 uppercase tracking-wide mb-2.5">💡 Related Questions</p>
+                        <div className="space-y-2">
+                          {msg.related_questions.map((q, qIdx) => (
+                            <button
+                              key={qIdx}
+                              onClick={() => { setInputText(q); handleSendMessage(q); }}
+                              className="w-full text-left text-sm px-3 py-2 rounded-lg hover:bg-indigo-50 transition-colors text-slate-700 hover:text-indigo-700 font-medium flex items-start gap-2"
+                            >
+                              <span className="text-indigo-500 mt-0.5 flex-shrink-0">→</span>
+                              <span className="leading-relaxed">{q}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
               <div ref={messagesEndRef} />
             </div>
 
             <div className="p-6 border-t border-slate-200 bg-white">
-              <div className="max-w-3xl mx-auto relative">
-                <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".pdf,.docx,.txt" />
-                <div className="absolute left-4 top-1/2 -translate-y-1/2">
-                  <Paperclip size={18} className="text-slate-400 cursor-pointer hover:text-slate-600" onClick={() => fileInputRef.current?.click()} />
-                </div>
-                <input 
-                  className="w-full bg-slate-50 border border-slate-200 rounded-2xl py-4 pl-12 pr-14 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 transition-all disabled:opacity-50"
-                  placeholder="Ask questions about company documents..."
-                  value={inputText}
-                  onChange={(e) => setInputText(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-                  disabled={isProcessing || isLoadingHistory}
-                />
-                <div className="absolute right-3 top-1/2 -translate-y-1/2">
-                  <button 
-                    onClick={handleSendMessage} 
-                    className="bg-blue-600 p-2 rounded-xl text-white hover:bg-blue-700 shadow-md transition-colors disabled:opacity-50" 
-                    disabled={isProcessing || isLoadingHistory}
-                  >
-                    <Send size={18} />
-                  </button>
-                </div>
+              <div className="max-w-4xl mx-auto relative group flex items-center">
+                <button onClick={() => fileInputRef.current?.click()} disabled={isUploading} className="absolute left-4 z-10 p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all disabled:opacity-50">
+                  {isUploading ? <Loader2 size={20} className="animate-spin" /> : <Paperclip size={20} />}
+                </button>
+                <input className="w-full bg-slate-50 border border-slate-200 rounded-2xl py-4 pl-16 pr-16 text-sm focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-50 transition-all" placeholder="Query your internal knowledge base..." value={inputText} onChange={(e) => setInputText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSendMessage()} />
+                <button onClick={() => handleSendMessage()} disabled={isProcessing || !inputText.trim()} className="absolute right-3 bg-indigo-600 p-2.5 rounded-xl text-white hover:bg-indigo-700 shadow-md shadow-indigo-100 transition-all disabled:opacity-50">
+                  <Send size={18} />
+                </button>
+                <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".pdf,.txt,.docx" />
               </div>
             </div>
           </>
         ) : (
-          /* DOCUMENTS GRID VIEW */
-          <div className="flex-1 overflow-y-auto p-8">
-            <div className="max-w-5xl mx-auto space-y-6">
-              <div className="flex items-center justify-between">
-                <h1 className="text-xl font-bold text-slate-800">Company Database</h1>
-                <button 
-                  onClick={() => fileInputRef.current?.click()}
-                  className="bg-white border border-slate-200 text-slate-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-slate-50 flex items-center gap-2 shadow-sm"
-                >
-                  <Plus size={16} /> Upload New
-                </button>
-                <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".pdf,.docx,.txt" />
-              </div>
-
-              {allUniqueFiles.length === 0 ? (
-                <div className="text-center py-20 bg-white border border-slate-200 border-dashed rounded-2xl">
-                  <Database size={48} className="mx-auto text-slate-300 mb-4" />
-                  <h3 className="text-sm font-bold text-slate-600 mb-1">No documents in Database</h3>
-                  <p className="text-xs text-slate-400">Upload PDFs or text files to index them for AI retrieval.</p>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {allUniqueFiles.map((filename, idx) => {
-                    const localUrl = getFileUrl(filename);
-                    
-                    return (
-                      <div 
-                        key={idx} 
-                        onClick={() => setActiveDoc({ 
-                          title: filename, 
-                          content: "Stored in Supabase Vector Database. Ask the AI a question to retrieve specific content chunks.", 
-                          fileUrl: localUrl 
-                        })}
-                        className="bg-white p-4 rounded-xl border border-slate-200 hover:border-blue-400 hover:shadow-md transition-all cursor-pointer group flex items-start gap-4"
-                      >
-                        <div className={`p-3 rounded-lg ${filename.toLowerCase().endsWith('.pdf') ? 'bg-red-50 text-red-500' : 'bg-blue-50 text-blue-500'}`}>
-                          <FileText size={24} />
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <h4 className="text-sm font-bold text-slate-800 truncate group-hover:text-blue-600 transition-colors">{filename}</h4>
-                          <p className={`text-[10px] font-bold uppercase tracking-widest mt-1 ${localUrl ? 'text-green-600' : 'text-slate-400'}`}>
-                            {localUrl ? '🟢 Session PDF Ready' : '☁️ Database Memory'}
-                          </p>
-                        </div>
-                      </div>
-                    )
-                  })}
-                </div>
-              )}
-            </div>
-          </div>
+          <>
+            <KnowledgeBaseView
+              dbFiles={dbFiles}
+              isSyncing={isSyncing}
+              isUploading={isUploading}
+              onUploadClick={() => fileInputRef.current?.click()}
+              onDriveSync={() => handleDriveSync(false)}
+              onForceResync={() => handleDriveSync(true)}
+              onDeleteFile={handleDeleteFile}
+            />
+            <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".pdf,.txt,.docx" />
+          </>
         )}
       </main>
 
-      {/* --- DOCUMENT VIEWER WITH NATIVE HIGHLIGHTING --- */}
       {activeDoc && (
-        <aside className="w-1/2 border-l border-slate-200 bg-slate-100 flex flex-col animate-in slide-in-from-right duration-300 shrink-0 shadow-[-10px_0_30px_rgba(0,0,0,0.05)] z-10">
-          <header className="h-14 border-b border-slate-200 bg-white flex items-center justify-between px-4 shrink-0">
+        <aside className="w-1/2 bg-slate-50 flex flex-col shrink-0 animate-in slide-in-from-right duration-500 ease-out z-20 shadow-2xl border-l border-slate-200">
+          <header className="h-16 border-b border-slate-200 bg-white flex items-center justify-between px-6 shrink-0">
             <div className="flex items-center gap-3">
-              <div className="bg-red-50 p-1.5 rounded">
-                <FileText className="text-red-500 w-5 h-5" />
+              <div className="w-8 h-8 bg-indigo-50 rounded-lg flex items-center justify-center text-indigo-600">
+                <FileText size={18} />
               </div>
-              <div className="overflow-hidden">
-                <h3 className="text-sm font-bold leading-tight truncate">{activeDoc.title}</h3>
-                <span className="text-[10px] text-green-600 font-bold bg-green-50 px-1.5 rounded uppercase">Verified Source</span>
+              <div>
+                <h3 className="text-sm font-bold text-slate-800 truncate max-w-[250px]">{activeDoc.title}</h3>
+                <span className="text-[9px] font-black text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full uppercase tracking-widest flex items-center gap-1 w-fit mt-1">
+                  <CheckCircle2 size={10} /> Source Authenticated
+                </span>
               </div>
             </div>
-            <X size={20} className="cursor-pointer hover:text-slate-800 shrink-0" onClick={() => setActiveDoc(null)} />
+            <button onClick={() => setActiveDoc(null)} className="p-2 hover:bg-slate-100 rounded-xl transition-colors text-slate-400 hover:text-slate-900">
+              <X size={20} />
+            </button>
           </header>
 
-          <div className="flex-1 overflow-hidden bg-slate-200 relative">
-            {activeDoc.fileUrl && activeDoc.title.toLowerCase().endsWith('.pdf') ? (
-              <iframe 
-                src={`${activeDoc.fileUrl}${activeDoc.content.includes("Stored in Supabase") ? '' : `#search=${getSearchQuery(activeDoc.content)}&view=FitH`}&toolbar=0&navpanes=0`} 
+          <div className="flex-1 overflow-hidden relative">
+            {activeDoc.fileUrl ? (
+              <iframe
+                src={`${activeDoc.fileUrl}#toolbar=0&navpanes=0&view=FitH`}
                 className="w-full h-full border-0"
-                title={activeDoc.title}
               />
             ) : (
-              <div className="h-full overflow-y-auto p-12 flex justify-center">
-                <div className="bg-white w-full max-w-2xl shadow-xl p-16 relative h-fit">
-                  <div className="flex items-center gap-2 mb-6 border-b pb-2 text-orange-600">
-                    <Info size={16} />
-                    <span className="text-xs font-bold uppercase tracking-widest">Extracted Text View</span>
+              <div className="h-full p-12 overflow-y-auto">
+                <div className="max-w-2xl mx-auto space-y-8">
+                  <div className="bg-white p-10 rounded-3xl shadow-sm border border-slate-200 relative">
+                    <div className="absolute -top-3 -left-3 bg-indigo-600 text-white p-2 rounded-xl shadow-lg">
+                      <Info size={16} />
+                    </div>
+                    <h4 className="text-[11px] font-black text-indigo-600 uppercase tracking-[0.2em] mb-6 flex items-center gap-2">
+                      Exact Knowledge Fragment
+                    </h4>
+                    <p className="text-[15px] leading-[1.8] text-slate-700 font-medium whitespace-pre-wrap">
+                      {activeDoc.content}
+                    </p>
                   </div>
-                  <div className="bg-blue-50 border-l-4 border-blue-600 p-6 text-sm text-slate-800 leading-relaxed font-medium whitespace-pre-wrap">
-                    {activeDoc.content}
+
+                  <div className="bg-slate-100 p-6 rounded-2xl border border-slate-200">
+                    <p className="text-[11px] text-slate-500 font-bold leading-relaxed">
+                      The AI extracted this specific paragraph from the source document to formulate your answer. The original file is stored securely in your vector database.
+                    </p>
                   </div>
-                  <p className="mt-8 text-xs text-slate-400 italic">
-                    {activeDoc.title.toLowerCase().endsWith('.pdf') 
-                      ? "Original file unavailable in browser memory. Please re-upload without refreshing to view the PDF layout." 
-                      : "Browsers cannot render this file format natively. Displaying text view."}
-                  </p>
                 </div>
               </div>
             )}

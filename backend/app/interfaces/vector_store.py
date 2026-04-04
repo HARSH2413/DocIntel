@@ -7,7 +7,7 @@ class IVectorStore(ABC):
         pass
 
     @abstractmethod
-    def search_similar(self, query_vector: List[float], tenant_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+    def search_similar(self, query_vector: list[float], query_text: str, tenant_id: str, limit: int = 5) -> list[dict]:
         pass
 
     # 🛡️ THE NEW RULES
