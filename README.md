@@ -103,10 +103,7 @@ Groq LLM
    │
    ▼
 Grounded answer + citations
-YOUR TREE HERE
 ```
-
-
 
 🧰 Tech Stack
 
@@ -238,6 +235,8 @@ Supabase PostgreSQL / RPC
 
 Optional Redis-compatible caching
 
+```text
+
 📁 Project Structure
 
 Action.ai/
@@ -294,6 +293,7 @@ Action.ai/
 ├── deploy-free-tier.sh
 ├── PERFORMANCE_OPTIMIZATION_GUIDE.md
 └── QUICK_START_SPEED.md
+```
 
 🚀 Getting Started
 
