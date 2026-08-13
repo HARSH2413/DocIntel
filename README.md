@@ -26,6 +26,7 @@ ActionRAG lets users build a searchable knowledge base from documents and Google
 
 🎛️ Config-driven RAG — expensive features such as HyDE, multi-query retrieval, neighbor context and follow-up generation can be enabled/disabled through environment variables.
 
+```text
 🏗️ Architecture
 
 ┌──────────────────────────────┐
@@ -102,6 +103,10 @@ Groq LLM
    │
    ▼
 Grounded answer + citations
+YOUR TREE HERE
+```
+
+
 
 🧰 Tech Stack
 
