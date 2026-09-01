@@ -1,6 +1,6 @@
 Enterprise-style, tenant-aware Retrieval-Augmented Generation (RAG) knowledge assistant built with Next.js, FastAPI, Supabase/pgvector, Groq, and local embedding/reranking models.
 
-ActionRAG lets users build a searchable knowledge base from documents and Google Drive content, then ask natural-language questions and receive grounded answers with source citations.
+DocIntel lets users build a searchable knowledge base from documents and Google Drive content, then ask natural-language questions and receive grounded answers with source citations.
 
 ✨ Highlights
 
@@ -543,7 +543,7 @@ Google Workspace files are exported to supported formats before being processed.
 
 🔍 Retrieval & RAG Configuration
 
-ActionRAG is intentionally configurable.
+DocIntel is intentionally configurable.
 
 Important settings include:
 
@@ -771,11 +771,11 @@ Harsh Malokar
 
 Built as an AI-powered knowledge assistant focused on grounded enterprise Q&A, document retrieval and practical RAG performance.
 
-⭐ Why ActionRAG?
+⭐ Why DocIntel?
 
 Traditional chatbots answer from a model's learned knowledge.
 
-ActionRAG takes a different approach:
+DocIntel takes a different approach:
 
 Your documents
       ↓
