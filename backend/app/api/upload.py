@@ -1,0 +1,271 @@
+"""
+Upload API — stream-hashed file uploads to prevent memory spikes.
+"""
+import os
+import hashlib
+import tempfile
+import threading
+import uuid
+import zipfile
+from pathlib import Path
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks, Request
+from starlette.concurrency import run_in_threadpool
+from app.services.ingestion_service import IngestionService, PartialIngestionError, UserFacingIngestionError
+from app.core.dependencies import get_ingestion_service
+from app.core.config import settings
+from app.core.logger import logger
+from app.core.rate_limiter import limiter
+
+# ARCHITECTURE NOTE:
+# This pipeline currently uses FastAPI BackgroundTasks for ingestion.
+# This is a non-durable queue. If the server restarts, ongoing ingestion tasks are lost.
+# For production scale, this should be migrated to a durable task queue like Celery, Redis Queue (RQ), or Temporal.
+
+router = APIRouter(prefix="/api/v1/upload", tags=["Document Management"])
+
+TEMP_DIR = os.path.join(tempfile.gettempdir(), "docintel_uploads")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# 64KB chunks for stream hashing
+HASH_CHUNK_SIZE = 65536
+ALLOWED_EXTENSIONS = {".pdf", ".txt", ".docx", ".csv", ".xlsx"}
+# Office files are zip archives; a real DOCX/XLSX always contains this folder.
+ZIP_CONTAINER_PREFIX = {".docx": "word/", ".xlsx": "xl/"}
+UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
+
+# Embedding is CPU-heavy: run a few ingestions at a time and refuse new uploads
+# once too many are waiting, instead of letting a burst exhaust CPU and threads.
+_ingestion_slots = threading.BoundedSemaphore(settings.MAX_CONCURRENT_INGESTIONS)
+_pending_lock = threading.Lock()
+_pending_ingestions = 0
+
+
+def _reserve_ingestion_slot() -> bool:
+    global _pending_ingestions
+    with _pending_lock:
+        if _pending_ingestions >= settings.MAX_PENDING_INGESTIONS:
+            return False
+        _pending_ingestions += 1
+        return True
+
+
+def _release_ingestion_slot() -> None:
+    global _pending_ingestions
+    with _pending_lock:
+        _pending_ingestions = max(0, _pending_ingestions - 1)
+
+
+def _validate_file_content(path: str, ext: str) -> None:
+    """Check the bytes match the extension, and cap zip expansion for DOCX/XLSX.
+
+    The client-supplied MIME type proves nothing; parsers (PyMuPDF, lxml, openpyxl)
+    should only ever see files that at least look like what they claim to be.
+    """
+    with open(path, "rb") as f:
+        head = f.read(8192)
+
+    if ext == ".pdf":
+        # The PDF header may appear anywhere in the first 1 KB.
+        if b"%PDF-" not in head[:1024]:
+            raise HTTPException(status_code=415, detail="File content is not a valid PDF.")
+    elif ext in ZIP_CONTAINER_PREFIX:
+        label = ext[1:].upper()
+        if not zipfile.is_zipfile(path):
+            raise HTTPException(status_code=415, detail=f"File content is not a valid {label} file.")
+        with zipfile.ZipFile(path) as archive:
+            members = archive.infolist()
+            if not any(m.filename.startswith(ZIP_CONTAINER_PREFIX[ext]) for m in members):
+                raise HTTPException(status_code=415, detail=f"File content is not a valid {label} file.")
+            # zipfile enforces these declared sizes while reading, so the sum is a hard cap.
+            expanded = sum(m.file_size for m in members)
+            if expanded > settings.MAX_UNCOMPRESSED_UPLOAD_MB * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="File expands beyond the allowed size when unpacked.")
+    else:  # .txt / .csv
+        if b"\x00" in head and not head.startswith(UTF16_BOMS):
+            raise HTTPException(status_code=415, detail="Text files must not contain binary content.")
+
+
+def _user_safe_error(error: Exception) -> str:
+    """Message stored on the document and shown in the UI; internals stay in the server log."""
+    if isinstance(error, UserFacingIngestionError):
+        return str(error)
+    if isinstance(error, PartialIngestionError):
+        return "Some parts of this document could not be processed. Please upload it again."
+    return "Processing failed. Please upload the document again."
+
+
+from app.core.auth import get_current_user, verify_box_access, UserContext
+
+@router.post("/box")
+@limiter.limit(settings.RATE_LIMIT_UPLOAD)
+async def upload_document(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    box_id: str = Form(...),
+    ingestion_service: IngestionService = Depends(get_ingestion_service),
+    user: UserContext = Depends(get_current_user),
+):
+    await run_in_threadpool(verify_box_access, box_id, user.user_id)
+    original_filename = Path(file.filename or "").name
+    safe_ext = Path(original_filename).suffix.lower()
+    if not original_filename or safe_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Supported file types: PDF, TXT, DOCX, CSV, XLSX.")
+
+    valid_mime_types = {
+        ".pdf": "application/pdf",
+        ".txt": "text/plain",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".csv": "text/csv",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    }
+    expected_mime = valid_mime_types.get(safe_ext)
+    # Basic validation: ensure content_type matches the extension conceptually (e.g. not an image)
+    if file.content_type and not file.content_type.startswith(("application/", "text/")):
+        raise HTTPException(status_code=415, detail="Invalid file content type.")
+
+    document_count = await run_in_threadpool(ingestion_service.db.count_documents, box_id)
+    if document_count >= settings.MAX_DOCUMENTS_PER_BOX:
+        raise HTTPException(
+            status_code=403,
+            detail=f"This box already has the maximum of {settings.MAX_DOCUMENTS_PER_BOX} documents.",
+        )
+
+    if not _reserve_ingestion_slot():
+        raise HTTPException(status_code=429, detail="The server is busy processing documents. Please try again shortly.")
+    task_scheduled = False
+    temp_path = None
+    file_path = None
+
+    try:
+        # 1. Stream-hash: compute SHA-256 WITHOUT loading entire file into memory
+        sha256 = hashlib.sha256()
+        max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+        bytes_written = 0
+
+        # Write to a temp file AND hash simultaneously
+        fd, temp_path = tempfile.mkstemp(prefix="upload_", suffix=safe_ext, dir=TEMP_DIR)
+        os.close(fd)
+        with open(temp_path, "wb") as f:
+            while True:
+                chunk = await file.read(HASH_CHUNK_SIZE)
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if bytes_written > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds the {settings.MAX_UPLOAD_SIZE_MB} MB upload limit.",
+                    )
+                sha256.update(chunk)
+                f.write(chunk)
+
+        file_hash = sha256.hexdigest()
+        await run_in_threadpool(_validate_file_content, temp_path, safe_ext)
+
+        # 2. Rename temp file to hash-based filename with UUID to prevent concurrent collision
+        file_path = os.path.join(TEMP_DIR, f"{file_hash}_{uuid.uuid4().hex}{safe_ext}")
+        os.replace(temp_path, file_path)
+
+        # 3. Create document record immediately to prevent race conditions and mark as processing
+        try:
+            document_id = await run_in_threadpool(
+                ingestion_service.db.create_document,
+                {
+                    "box_id": box_id,
+                    "filename": original_filename,
+                    "file_hash": file_hash,
+                    "mime_type": file.content_type or expected_mime,
+                    "status": "processing"
+                }
+            )
+        except Exception as e:
+            err_str = str(e).lower()
+            if "unique" in err_str or "duplicate" in err_str or "23505" in err_str:
+                # Check if it's a failed document we can overwrite
+                existing = await run_in_threadpool(ingestion_service.db.get_document_metadata, box_id)
+                failed_doc = next((d for d in existing if d.get("file_hash") == file_hash and d.get("status") == "failed"), None)
+                if failed_doc:
+                    logger.info(f"Retrying failed document {failed_doc['id']}.")
+                    await run_in_threadpool(ingestion_service.db.delete_document, document_id=failed_doc["id"], box_id=box_id)
+                    document_id = await run_in_threadpool(
+                        ingestion_service.db.create_document,
+                        {
+                            "box_id": box_id,
+                            "filename": original_filename,
+                            "file_hash": file_hash,
+                            "mime_type": file.content_type or expected_mime,
+                            "status": "processing"
+                        }
+                    )
+                else:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    raise HTTPException(status_code=409, detail="Exact file content already exists. Duplicate rejected.")
+            else:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                raise HTTPException(status_code=500, detail="Failed to initialize document processing.")
+
+        background_tasks.add_task(
+            _process_upload_safely,
+            ingestion_service,
+            file_path=file_path,
+            filename=original_filename,
+            file_hash=file_hash,
+            box_id=box_id,
+            document_id=document_id
+        )
+        task_scheduled = True
+
+        logger.info(f"Upload accepted: '{original_filename}' (hash={file_hash[:12]}...)")
+
+        # 5. Instantly return success to the frontend
+        return {
+            "status": "processing",
+            "message": f"'{original_filename}' is processing in the background.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Upload failed for '{original_filename}': {e}")
+        raise HTTPException(status_code=500, detail="Unable to process the uploaded file.")
+    finally:
+        if not task_scheduled:
+            # Nothing will run in the background: free the slot and drop any file we wrote.
+            _release_ingestion_slot()
+            for leftover in (temp_path, file_path):
+                if leftover and os.path.exists(leftover):
+                    os.remove(leftover)
+
+
+def _process_upload_safely(
+    ingestion_service: IngestionService,
+    file_path: str,
+    filename: str,
+    file_hash: str,
+    box_id: str,
+    document_id: str,
+) -> None:
+    """Keep an ingestion failure isolated and emit an actionable server log."""
+    try:
+        with _ingestion_slots:
+            ingestion_service.process_file_background(
+                file_path=file_path,
+                filename=filename,
+                file_hash=file_hash,
+                box_id=box_id,
+                document_id=document_id,
+            )
+        from app.core.cache import global_query_cache
+        global_query_cache.invalidate_box(box_id)
+    except Exception as e:
+        # This is deliberately a final boundary around the background task.
+        # The service already logs detailed extraction/batch failures.
+        logger.exception(f"Background ingestion crashed for '{filename}'")
+        try:
+            ingestion_service.db.update_document_status(document_id, "failed", _user_safe_error(e))
+        except Exception as db_e:
+            logger.exception(f"Failed to update document {document_id} status to failed: {db_e}")
+    finally:
+        _release_ingestion_slot()
