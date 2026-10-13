@@ -11,8 +11,9 @@ const contentSecurityPolicy = [
   "default-src 'self'",
   // Next.js injects inline bootstrap scripts; dev mode additionally needs eval for fast refresh.
   `script-src 'self' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ""}`,
-  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-  "font-src 'self' https://fonts.gstatic.com data:",
+  "style-src 'self' 'unsafe-inline'",
+  // Fonts are self-hosted by next/font.
+  "font-src 'self' data:",
   // No remote images: closes the markdown-image exfiltration channel at the browser level too.
   "img-src 'self' data: blob:",
   `connect-src 'self' ${apiOrigin} ${supabaseOrigins.join(" ")}${isDev ? " ws: wss:" : ""}`,

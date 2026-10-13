@@ -7,6 +7,10 @@ from app.api.upload import _process_upload_safely
 @pytest.fixture
 def ingestion_service():
     db_mock = MagicMock()
+    # Behave like the real table: the stored count is whatever was saved.
+    stored = set()
+    db_mock.save_document_chunks.side_effect = lambda records: stored.update(r["chunk_index"] for r in records) or len(records)
+    db_mock.count_document_chunks.side_effect = lambda document_id: len(stored)
     embedder_mock = MagicMock()
     service = IngestionService(db=db_mock, embedder=embedder_mock, lexical_store=MagicMock())
     # mock split_text so we don't need real text splitting

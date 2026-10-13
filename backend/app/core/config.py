@@ -58,7 +58,10 @@ class Settings(BaseSettings):
     ANSWER_MIN_RELEVANCE_SCORE: float = 0.12
     
     # ── Chat & Responses ──
-    FALLBACK_PHRASE: str = "I could not find the answer to this in the provided company documents."
+    # Worded as "not retrieved", not "not in the documents": retrieval reads only the top-ranked
+    # sections, so it can never confirm that something is absent from a document.
+    FALLBACK_PHRASE: str = "I couldn't find relevant passages for this in the retrieved sections of your documents."
+    LLM_MAX_OUTPUT_TOKENS: int = 2048  # room for structured answers (headings, tables) without truncation
     ENABLE_QUERY_REWRITE: bool = False  # LLM-based query rewriting for multi-turn
     ENABLE_NEIGHBOR_CONTEXT: bool = True  # sibling-only expansion for hierarchical chunks
     ENABLE_RERANK_DEBUG_LOGGING: bool = False # Logs dropped chunks and raw scores per query
@@ -90,6 +93,9 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 1400
     CHUNK_OVERLAP: int = 200
     INGESTION_BATCH_SIZE: int = 10     # keep small to avoid OOM with large embedding models
+    # A document still 'processing' after this long is treated as abandoned (server
+    # restart mid-ingestion) and marked failed so it can be uploaded again.
+    STALE_PROCESSING_MINUTES: int = 60
 
     # ── Citation Firewall ──
     CITATION_ENFORCEMENT_MODE: str = "soft"  # 'strict' or 'soft'

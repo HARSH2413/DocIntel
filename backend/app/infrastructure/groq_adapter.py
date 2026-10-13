@@ -58,5 +58,6 @@ class GroqAdapter(ILLM):
             model=self.model_name,
             temperature=temperature,
             messages=messages,
+            max_completion_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
         )
         return response.choices[0].message.content

@@ -125,7 +125,8 @@ def test_chat_service_fallback(chat_service):
     
     res = chat_service.ask_question("test question", "box_id", "session_id")
     
-    assert "could not find the answer" in res["answer"]
+    # Worded as "not retrieved", never as a claim that the documents lack the answer
+    assert "retrieved sections" in res["answer"]
     assert len(res["citations"]) == 0
     assert len(res["closest_matches"]) == 1
     assert res["closest_matches"][0]["document_id"] == "doc1"

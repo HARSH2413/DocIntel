@@ -11,6 +11,13 @@ from app.services.retrieval_engine import RetrievalEngine
 from app.services.evidence_engine import EvidenceEngine
 from app.services.query_router import RuleBasedQueryRouter
 from app.services.query_expansion import QueryExpansionService
+from app.services.answer_planner import AnswerPlan, FORMAT_GUIDES, part_is_covered, plan_answer
+from app.utils.citation_validator import parse_answer_lines
+
+# Multi-part questions: chunks kept per search list (whole question + each part), and the cap
+# on total evidence so the context stays within what the model handles well.
+EVIDENCE_PER_PART = 2
+MAX_MULTI_PART_EVIDENCE = 10
 
 
 class ChatService:
@@ -87,9 +94,16 @@ class ChatService:
             variants = expansion["variants"]
         rewrite_ms = (time.perf_counter() - rewrite_start) * 1000
 
+        # Question type picks the answer structure; multi-part questions get per-part evidence.
+        plan = plan_answer(rewritten_query)
+        logger.info(f"Answer plan: type={plan.question_type} | parts={len(plan.parts)}")
+
         # 4. Retrieval Pipeline (First Pass)
         retrieval_start = time.perf_counter()
-        retrieved_docs = self.retrieval_engine.retrieve_documents(search_query=rewritten_query, box_id=box_id)
+        if plan.is_multi_part:
+            retrieved_docs = self._retrieve_for_parts(rewritten_query, plan, box_id)
+        else:
+            retrieved_docs = self.retrieval_engine.retrieve_documents(search_query=rewritten_query, box_id=box_id)
         retrieval_ms = (time.perf_counter() - retrieval_start) * 1000
 
         # 5. Evidence Gate
@@ -159,6 +173,7 @@ class ChatService:
         system_prompt = self._build_system_prompt(
             context_text=context_text,
             fallback_phrase=fallback_phrase,
+            plan=plan,
         )
 
         messages = [{"role": "system", "content": system_prompt}]
@@ -190,6 +205,7 @@ class ChatService:
             retry_prompt = (
                 "You previously answered without using the required evidence citations. "
                 "Please rewrite your answer citing the supporting evidence IDs using [E1], [E2], etc. from the context. "
+                "Keep the same structure (headings, lists, tables). "
                 f"If the context contains absolutely zero information to answer the question, output exactly: '{fallback_phrase}'"
             )
             
@@ -204,7 +220,30 @@ class ChatService:
                 
             answer, citations, unsupported_sentences, stripped_citations = self._validate_and_build_citations(answer, retrieved_docs, fallback_phrase)
             retried = True
-            
+
+        # Completeness check: every requested part answered (or disclosed as not retrieved) and
+        # the structure the question type calls for. At most one retry per question in total,
+        # and the rewrite is only kept if it still carries valid citations.
+        problems = self._answer_problems(answer, plan) if citations and not retried else []
+        if problems:
+            logger.info(f"Answer incomplete ({'; '.join(problems)}). Retrying once.")
+            retry_prompt = (
+                "Rewrite your full answer to fix the following: " + " ".join(problems) + " "
+                "Keep every valid [E#] citation next to the claim it supports. For any part the evidence "
+                "does not cover, write one line: 'The retrieved sections do not cover <that part>.' "
+                "Return only the answer."
+            )
+            messages.append({"role": "assistant", "content": answer})
+            messages.append({"role": "user", "content": retry_prompt})
+            try:
+                candidate = self.llm.chat_with_messages(messages=messages, temperature=0.0)
+                validated = self._validate_and_build_citations(candidate, retrieved_docs, fallback_phrase)
+                if validated[1]:
+                    answer, citations, unsupported_sentences, stripped_citations = validated
+            except Exception as e:
+                logger.error(f"LLM completeness retry failed: {e}")
+            retried = True
+
         if not citations:
             answer = fallback_phrase
 
@@ -236,100 +275,100 @@ class ChatService:
         }
 
     def _validate_and_build_citations(self, answer: str, retrieved_docs: list[dict], fallback_phrase: str):
-        from app.utils.citation_validator import split_into_sentences, extract_normalized_numbers, is_factual_sentence
+        from app.utils.citation_validator import (
+            claim_text, extract_normalized_numbers, is_factual_sentence, parse_answer_lines,
+            render_answer_lines, soften_absence_claims, strip_internal_sections,
+        )
         from app.core.config import settings
         import re
-        
+
+        strict = settings.CITATION_ENFORCEMENT_MODE == "strict"
+
+        # Drop leaked checklist/reasoning sections, and restate "the document does not mention X"
+        # as "not retrieved": retrieval never reads the whole document, so absence is unconfirmed.
+        answer = strip_internal_sections(answer)
+        answer = soften_absence_claims(answer)
+
         # Normalize bracket variations like 【E1】, 【E1†L1-L2】, [E1:p140], etc. to [E1]
         answer = re.sub(r'【E(\d+)[^】]*】', r'[E\1]', answer)
         answer = re.sub(r'\[E(\d+)[^\]]*\]', r'[E\1]', answer)
         found_numbers = set(re.findall(r'\[E(\d+)\]', answer))
         used_evidence_ids = {f"[E{num}]" for num in found_numbers}
-        
+
         doc_map = {doc.get("evidence_id"): doc for doc in retrieved_docs if doc.get("evidence_id")}
         valid_evidence_ids = set(doc_map.keys())
-        
-        sentences = split_into_sentences(answer)
+
         unsupported_sentences = []
         stripped_citations = []
-        
+
         # 1. Clean up invalid citations that do not exist in the context
         for used_id in used_evidence_ids:
             if used_id not in valid_evidence_ids:
                 answer = re.sub(re.escape(used_id), "", answer)
                 stripped_citations.append(used_id)
-                
-        # Re-split sentences after removing nonexistent IDs
-        sentences = split_into_sentences(answer)
-        
+
+        # 2. Check every claim. The answer is parsed line by line so markdown structure
+        # (headings, lists, tables) survives; a table row is checked as one claim.
+        lines = parse_answer_lines(answer)
+        removed = set()  # (line, unit) claims dropped in strict mode
         pairs_to_score = []
-        sentence_contexts = []
-        
-        for i, s in enumerate(sentences):
-            if not is_factual_sentence(s):
-                continue
-                
-            cites_in_s = set(re.findall(r'\[E\d+\]', s))
-            valid_cites_in_s = cites_in_s.intersection(valid_evidence_ids)
-            
-            if not valid_cites_in_s:
-                unsupported_sentences.append(s)
-                continue
-                
-            # Strip citation tags before checking numbers to avoid matching citation digits
-            s_clean_of_tags = re.sub(r'\[E\d+\]', '', s).strip()
-            nums_in_s = extract_normalized_numbers(s_clean_of_tags)
-            
-            # Combine text of all cited chunks for number verification
-            chunk_texts = []
-            for cid in valid_cites_in_s:
-                doc = doc_map[cid]
-                text = doc.get("content", "")
-                if doc.get("neighbor_context"):
-                    text += " " + doc.get("neighbor_context", "")
-                chunk_texts.append(text)
-                
-            combined_text = " ".join(chunk_texts)
-            nums_in_chunk = extract_normalized_numbers(combined_text)
-            
-            number_supported = nums_in_s.issubset(nums_in_chunk) if nums_in_s else True
-            
-            if not number_supported:
-                unsupported_sentences.append(s)
-                if settings.CITATION_ENFORCEMENT_MODE == "strict":
-                    for cid in valid_cites_in_s:
-                        s = s.replace(cid, "")
-                        stripped_citations.append(cid)
-                    sentences[i] = s
+        unit_contexts = []
+
+        for li, line in enumerate(lines):
+            for ui, s in enumerate(line.units):
+                s_clean = claim_text(s)
+                is_claim = len(s_clean.split()) >= 2 if line.kind == "table_row" else is_factual_sentence(s)
+                if not is_claim:
                     continue
-                
-            s_clean = s_clean_of_tags
-            for cid in valid_cites_in_s:
-                pairs_to_score.append((s_clean, doc_map[cid].get("content", "")))
-                sentence_contexts.append((i, cid))
-                
+
+                valid_cites_in_s = set(re.findall(r'\[E\d+\]', s)).intersection(valid_evidence_ids)
+                if not valid_cites_in_s:
+                    unsupported_sentences.append(s)
+                    if strict:
+                        removed.add((li, ui))
+                    continue
+
+                # Numbers in the claim must appear in the cited chunks (citation digits excluded)
+                nums_in_s = extract_normalized_numbers(s_clean)
+                chunk_texts = []
+                for cid in valid_cites_in_s:
+                    doc = doc_map[cid]
+                    text = doc.get("content", "")
+                    if doc.get("neighbor_context"):
+                        text += " " + doc.get("neighbor_context", "")
+                    chunk_texts.append(text)
+                nums_in_chunk = extract_normalized_numbers(" ".join(chunk_texts))
+                number_supported = nums_in_s.issubset(nums_in_chunk) if nums_in_s else True
+
+                if not number_supported:
+                    unsupported_sentences.append(s)
+                    if strict:
+                        stripped_citations.extend(valid_cites_in_s)
+                        removed.add((li, ui))
+                        continue
+
+                for cid in valid_cites_in_s:
+                    pairs_to_score.append((s_clean, doc_map[cid].get("content", "")))
+                    unit_contexts.append(((li, ui), cid))
+
         if pairs_to_score and self.reranker:
             scores = self.reranker.score_pairs(pairs_to_score)
-            support_by_sentence = {}
-            for (idx, cid), score in zip(sentence_contexts, scores):
-                if idx not in support_by_sentence:
-                    support_by_sentence[idx] = []
-                support_by_sentence[idx].append((cid, score))
-                
-            for idx, results in support_by_sentence.items():
-                max_score = max(score for cid, score in results)
-                if max_score < settings.CITATION_SUPPORT_THRESHOLD:
-                    unsupported_sentences.append(sentences[idx])
-                    if settings.CITATION_ENFORCEMENT_MODE == "strict":
-                        for cid, _ in results:
-                            sentences[idx] = sentences[idx].replace(cid, "")
-                            stripped_citations.append(cid)
-                        
-        final_answer = " ".join(sentences)
-        
-        if settings.CITATION_ENFORCEMENT_MODE == "strict":
-            final_answer = " ".join([s for s in sentences if s not in unsupported_sentences])
-                
+            support_by_unit = {}
+            for (key, cid), score in zip(unit_contexts, scores):
+                support_by_unit.setdefault(key, []).append((cid, score))
+
+            for (li, ui), results in support_by_unit.items():
+                if max(score for _, score in results) < settings.CITATION_SUPPORT_THRESHOLD:
+                    unsupported_sentences.append(lines[li].units[ui])
+                    if strict:
+                        stripped_citations.extend(cid for cid, _ in results)
+                        removed.add((li, ui))
+
+        if strict:
+            for li, line in enumerate(lines):
+                line.units = [u for ui, u in enumerate(line.units) if (li, ui) not in removed]
+        final_answer = render_answer_lines(lines, drop_emptied=strict)
+
         final_found = set(re.findall(r'\[E(\d+)\]', final_answer))
         final_used = {f"[E{num}]" for num in final_found}
         
@@ -351,21 +390,72 @@ class ChatService:
                 
         return final_answer, citations, unsupported_sentences, list(set(stripped_citations))
 
-    def _build_system_prompt(self, context_text: str, fallback_phrase: str) -> str:
-        return f"""You are DocIntel, an expert Enterprise Knowledge Agent.
+    def _retrieve_for_parts(self, question: str, plan: AnswerPlan, box_id: str) -> list[dict]:
+        """One search for the whole question plus one per requested part, merged round-robin
+        so every part keeps its best chunks instead of the strongest part taking every slot."""
+        ranked_lists = [
+            self.retrieval_engine.retrieve_documents(search_query=query, box_id=box_id)
+            for query in [question] + plan.retrieval_queries
+        ]
+        budget = min(MAX_MULTI_PART_EVIDENCE, max(self.reranker_top_k, EVIDENCE_PER_PART * len(ranked_lists)))
+        merged, seen = [], set()
+        for rank in range(max(len(ranked) for ranked in ranked_lists)):
+            for ranked in ranked_lists:
+                if rank >= len(ranked) or len(merged) >= budget:
+                    continue
+                key = (ranked[rank].get("document_id"), ranked[rank].get("chunk_index"))
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(dict(ranked[rank]))  # copy: ranked lists may come from the shared cache
+        return merged
 
-INSTRUCTIONS:
-1. FACTUAL ACCURACY: Answer the user's question using ONLY the facts provided in the CONTEXT below. Never invent, assume, or hallucinate information not present in the sources.
-2. DETAIL LEVEL: Provide a concise but complete answer in 1-3 short paragraphs.
-3. OUTPUT STRUCTURE: Keep a natural narrative format, but still separate major ideas into clear paragraphs.
-4. EVIDENCE CITATION: The CONTEXT is divided into numbered evidence blocks (e.g., '--- EVIDENCE [E1] ---').
-   - You MUST base your factual claims ONLY on this supplied evidence.
-   - You MUST cite the supporting evidence IDs in your answer using the format [E1], [E2], etc. immediately after the claims they support.
-   - If the user asks about a specific document, ONLY use facts from that file's sections.
-   - If the evidence only contains brief mentions, a heading, or partial information about the topic, state what is mentioned in the evidence, cite the evidence ID (e.g., [E1]), and explicitly state what is missing or that detailed explanations/clauses are not present in the provided documents.
-5. SYNTHESIS: When multiple chunks are relevant, synthesize them into a coherent answer rather than repeating information.
-6. SOURCE-CLAIM DISCIPLINE: Do not make a claim unless it is supported by at least one retrieved source chunk.
-7. THE SHIELD: ONLY IF the CONTEXT contains absolutely zero information or relevance to the question, reply with EXACTLY: "{fallback_phrase}"
+    @staticmethod
+    def _answer_problems(answer: str, plan: AnswerPlan) -> list[str]:
+        """Requested parts the answer skipped, and missing structure the question type calls for."""
+        problems = []
+        if plan.is_multi_part:
+            missing = [part for part in plan.parts if not part_is_covered(part, answer)]
+            if missing:
+                problems.append("These requested parts were not addressed: " + "; ".join(f"'{p}'" for p in missing) + ".")
+
+        kinds = [line.kind for line in parse_answer_lines(answer)]
+        if plan.question_type == "comparison" and plan.is_multi_part \
+                and "table_row" not in kinds and kinds.count("heading") < 2:
+            problems.append("Present the comparison as a markdown table with the same criteria for each item.")
+        if plan.question_type == "process" and "list" not in kinds \
+                and re.search(r"\b(steps?|procedure|process|workflow|stages?)\b", plan.parts[0], re.I):
+            problems.append("Present the steps as a numbered list in their logical order.")
+        return problems
+
+    def _build_system_prompt(self, context_text: str, fallback_phrase: str, plan: AnswerPlan | None = None) -> str:
+        plan = plan or AnswerPlan("factual")
+        format_guide = FORMAT_GUIDES.get(plan.question_type, FORMAT_GUIDES["factual"])
+
+        parts_block = ""
+        if plan.question_type == "comparison" and plan.parts:
+            parts_block = "\nITEMS TO COMPARE (cover each on the same criteria): " + "; ".join(plan.parts) + "\n"
+        elif plan.is_multi_part:
+            listed = "\n".join(f"{i}. {part}" for i, part in enumerate(plan.parts, 1))
+            parts_block = f"\nREQUESTED PARTS (answer every one, in this order):\n{listed}\n"
+
+        return f"""You are DocIntel, an expert Enterprise Knowledge Agent. Answer using ONLY the evidence in CONTEXT.
+
+STRUCTURE:
+- {format_guide}
+- Answer the question directly and add nothing unrelated. One idea per paragraph; do not repeat information.
+- Use headings and tables only when they help; never for a simple factual question.
+{parts_block}
+EVIDENCE AND CITATIONS:
+- CONTEXT is split into blocks such as '--- EVIDENCE [E1] ---'. Every factual sentence, bullet and table row must cite its block, e.g. [E1], right after the claim.
+- Never invent evidence IDs, page numbers, quotations or facts. If the user names a file, use only that file's evidence.
+- Keep the source's meaning: preserve exceptions, conditions, qualifications, names, dates and who said what. Never turn a qualified statement into an absolute one.
+- When several blocks are relevant, combine them into one coherent answer.
+
+MISSING EVIDENCE:
+- Answer every part the evidence supports. For a part it does not cover, write: "The retrieved sections do not cover <that part>." Never claim the document as a whole lacks something.
+- ONLY IF the CONTEXT has nothing relevant to the question at all, reply with exactly: "{fallback_phrase}"
+
+OUTPUT: Return only the answer in markdown. No checklist, notes or reasoning.
 
 CONTEXT:
 {context_text}"""

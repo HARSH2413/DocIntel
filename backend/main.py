@@ -25,7 +25,7 @@ logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 from app.core.config import settings
 from app.core.rate_limiter import limiter
 from app.core.logger import logger
-from app.core.dependencies import _get_db_adapter, _get_embedder_adapter, _get_reranker_adapter
+from app.core.dependencies import _get_db_adapter, _get_embedder_adapter, _get_reranker_adapter, get_ingestion_service
 from app.core.retrieval_health import retrieval_health
 from app.api.chat import router as chat_router
 from app.api.upload import router as upload_router
@@ -82,6 +82,12 @@ async def lifespan(app: FastAPI):
     logger.info("Pre-loading reranker model...")
     _get_reranker_adapter()
     logger.info("Reranker model ready.")
+
+    # Ingestion runs in-process, so a restart abandons any in-flight documents.
+    try:
+        get_ingestion_service().fail_stale_documents()
+    except Exception as e:
+        logger.warning(f"Stale document sweep skipped: {e}")
 
     yield
     logger.info("DocIntel Backend shutting down")

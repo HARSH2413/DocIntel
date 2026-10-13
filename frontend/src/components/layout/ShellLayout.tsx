@@ -1,9 +1,14 @@
 "use client";
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { LayoutDashboard, FolderOpen, Sparkles, Settings, User, Plus, Menu, X, LogOut, PanelLeftClose, PanelRightClose, PanelLeftOpen } from 'lucide-react';
+import {
+  FolderOpen, LayoutDashboard, Loader2, LogOut, Menu, PanelLeftClose, PanelLeftOpen, Plus, Settings, Library, X,
+} from 'lucide-react';
+import { Logo } from '@/components/brand/Logo';
+import { useLocalStorage } from '@/lib/useClientState';
+import { CREATE_BOX_EVENT } from '@/lib/types';
 
 interface ShellLayoutProps {
   children: React.ReactNode;
@@ -11,194 +16,198 @@ interface ShellLayoutProps {
   userName?: string;
 }
 
+const NAV_ITEMS = [
+  { name: 'Dashboard', href: '/boxes', icon: LayoutDashboard },
+  { name: 'My boxes', href: '/boxes/all', icon: FolderOpen },
+  { name: 'Knowledge base', href: '/knowledge-base', icon: Library, badge: 'Soon' },
+  { name: 'Settings', href: '/settings', icon: Settings },
+];
+
+function isActive(pathname: string, href: string) {
+  if (href === '/boxes') return pathname === '/boxes';
+  // Individual box pages live under My boxes.
+  if (href === '/boxes/all') return pathname.startsWith('/boxes/');
+  return pathname === href || pathname.startsWith(`${href}/`);
+}
+
 export default function ShellLayout({ children, userEmail, userName }: ShellLayoutProps) {
   const pathname = usePathname();
   const router = useRouter();
-  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
-  const [showCreateBox, setShowCreateBox] = useState(false);
-  const [isCollapsed, setIsCollapsed] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [collapsedPref, setCollapsed] = useLocalStorage('docintel.shell.collapsed', false);
+  const [signingOut, setSigningOut] = useState(false);
+  // The collapsed rail is a desktop affordance; the mobile drawer always shows labels.
+  const collapsed = collapsedPref && !mobileOpen;
 
-  // Load collapsed state from local storage on mount
-  React.useEffect(() => {
-    try {
-      const saved = localStorage.getItem('docintel.shell.collapsed');
-      if (saved !== null) setIsCollapsed(JSON.parse(saved));
-    } catch {}
-  }, []);
+  const displayName = userName || userEmail || 'Account';
+  const initial = (userName || userEmail || '?').charAt(0).toUpperCase();
 
-  const toggleCollapsed = () => {
-    const newState = !isCollapsed;
-    setIsCollapsed(newState);
-    try { localStorage.setItem('docintel.shell.collapsed', JSON.stringify(newState)); } catch {}
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => { if (e.key === 'Escape') setMobileOpen(false); };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [mobileOpen]);
+
+  const handleNewBox = () => {
+    setMobileOpen(false);
+    // Box pages listen for the event and open the dialog in place; elsewhere, go to the dashboard.
+    if (pathname === '/boxes' || pathname === '/boxes/all') {
+      window.dispatchEvent(new CustomEvent(CREATE_BOX_EVENT));
+    } else {
+      router.push('/boxes?new=1');
+    }
   };
-
-  const navItems = [
-    { name: 'Dashboard', href: '/boxes', icon: LayoutDashboard },
-    { name: 'My Boxes', href: '/boxes/all', icon: FolderOpen },
-    { name: 'Knowledge Base', href: '/knowledge-base', icon: Sparkles, badge: 'Soon' },
-    { name: 'Settings', href: '/settings', icon: Settings },
-  ];
 
   const handleSignOut = async () => {
-    await fetch('/auth/logout', { method: 'POST' });
-    window.location.href = '/login';
-  };
-
-  const closeMobileMenu = () => setIsMobileMenuOpen(false);
-
-  const isActive = (href: string, name: string) => {
-    if (name === 'Dashboard') return pathname === '/boxes';
-    if (name === 'My Boxes') return pathname.startsWith('/boxes/');
-    return pathname === href;
+    setSigningOut(true);
+    try {
+      await fetch('/auth/logout', { method: 'POST' });
+    } finally {
+      router.replace('/login');
+      router.refresh();
+    }
   };
 
   return (
-    <div className="flex h-screen bg-[#f8fafc] text-[#0f172a] font-sans overflow-hidden">
-      {/* Mobile Overlay */}
-      {isMobileMenuOpen && (
-        <div className="fixed inset-0 bg-[#0f172a]/30 backdrop-blur-[3px] z-40 md:hidden" onClick={closeMobileMenu} />
+    <div className="flex h-dvh bg-[#f8fafc] text-[#0f172a] font-sans overflow-hidden">
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-60 focus:px-4 focus:py-2 focus:rounded-lg focus:bg-white focus:text-indigo-700 focus:shadow-lg focus:ring-2 focus:ring-indigo-600"
+      >
+        Skip to content
+      </a>
+
+      {mobileOpen && (
+        <div className="fixed inset-0 bg-[#0f172a]/30 backdrop-blur-[3px] z-40 md:hidden" aria-hidden="true" onClick={() => setMobileOpen(false)} />
       )}
 
-      {/* Sidebar */}
-      <aside className={`
-        fixed inset-y-0 left-0 z-50 bg-white border-r border-slate-200 flex flex-col p-4 transition-all duration-300 ease-in-out md:static md:translate-x-0
-        ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'}
-        ${isCollapsed ? 'w-20 items-center' : 'w-64'}
-      `}>
-        {/* Brand Header */}
-        <div className={`flex items-center py-3 mb-6 ${isCollapsed ? 'justify-center' : 'justify-between px-2 w-full'}`}>
-          {!isCollapsed && (
-            <div className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-lg bg-indigo-50 border border-indigo-100 flex shrink-0 items-center justify-center">
-                <Sparkles className="w-[18px] h-[18px] text-indigo-600" />
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="font-headline text-base font-semibold tracking-tight text-slate-900 truncate">DocIntel</div>
-                <div className="text-xs text-slate-500 leading-tight tracking-tight truncate">Precision AI</div>
-              </div>
-            </div>
+      <aside
+        id="app-sidebar"
+        aria-label="Main navigation"
+        className={`
+          fixed inset-y-0 left-0 z-50 bg-white border-r border-slate-200 flex flex-col p-4 transition-[transform,width] duration-300 ease-in-out md:static md:translate-x-0
+          ${mobileOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full'}
+          ${collapsed ? 'w-20 items-center' : 'w-64'}
+        `}
+      >
+        <div className={`flex items-center py-2 mb-6 ${collapsed ? 'justify-center' : 'justify-between pl-1 w-full'}`}>
+          {!collapsed && (
+            <Link href="/boxes" aria-label="DocIntel home" className="rounded-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-600">
+              <Logo />
+            </Link>
           )}
-          <button className="hidden md:flex text-slate-400 hover:text-slate-700 p-1.5 rounded-lg hover:bg-slate-100 transition-colors shrink-0" onClick={toggleCollapsed} title={isCollapsed ? "Open Sidebar" : "Close Sidebar"}>
-            {isCollapsed ? <PanelLeftOpen size={20} /> : <PanelLeftClose size={20} />}
+          <button
+            type="button"
+            className="hidden md:flex text-slate-400 hover:text-slate-700 p-1.5 rounded-lg hover:bg-slate-100 transition-colors shrink-0"
+            onClick={() => setCollapsed(!collapsedPref)}
+            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-controls="app-sidebar"
+            aria-expanded={!collapsed}
+          >
+            {collapsed ? <PanelLeftOpen size={20} aria-hidden="true" /> : <PanelLeftClose size={20} aria-hidden="true" />}
           </button>
-          <button className="ml-auto md:hidden text-slate-400 hover:text-slate-700" onClick={closeMobileMenu}>
-            <X size={20} />
+          <button
+            type="button"
+            className="md:hidden p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+            onClick={() => setMobileOpen(false)}
+            aria-label="Close menu"
+          >
+            <X size={20} aria-hidden="true" />
           </button>
         </div>
 
-        {/* New Box CTA */}
         <div className="mb-6 px-1 w-full">
           <button
-            onClick={() => {
-              closeMobileMenu();
-              window.dispatchEvent(new CustomEvent('docintel:create-box'));
-              if (!pathname.startsWith('/boxes')) router.push('/boxes');
-            }}
-            title={isCollapsed ? "New Box" : undefined}
-            className={`flex items-center justify-center py-2 rounded-lg bg-slate-50 border border-slate-200 hover:border-indigo-400 hover:bg-indigo-50/50 text-slate-700 hover:text-indigo-600 text-sm font-medium transition-all duration-150 ${isCollapsed ? 'w-10 h-10 px-0 mx-auto' : 'w-full gap-2 px-3'}`}
+            type="button"
+            onClick={handleNewBox}
+            title={collapsed ? 'New box' : undefined}
+            aria-label={collapsed ? 'New box' : undefined}
+            className={`flex items-center justify-center py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium shadow-sm transition-colors ${collapsed ? 'w-10 h-10 px-0 mx-auto' : 'w-full gap-2 px-3'}`}
           >
-            <Plus size={16} className="text-indigo-600 shrink-0" />
-            {!isCollapsed && <span>New Box</span>}
+            <Plus size={16} className="shrink-0" aria-hidden="true" />
+            {!collapsed && <span>New box</span>}
           </button>
         </div>
 
-        {/* Navigation */}
-        <nav className="space-y-1 flex-1 text-sm font-medium tracking-tight w-full">
-          {navItems.map((item) => {
-            const active = isActive(item.href, item.name);
-            const Icon = item.icon;
-            return (
-              <Link
-                key={item.name}
-                href={item.badge ? '#' : item.href}
-                onClick={(e) => {
-                  if (item.badge) { e.preventDefault(); return; }
-                  closeMobileMenu();
-                }}
-                title={isCollapsed ? item.name : undefined}
-                className={`
-                  flex items-center justify-between py-2 rounded-lg transition-colors duration-150
-                  ${isCollapsed ? 'justify-center px-0 w-10 mx-auto' : 'px-3'}
-                  ${active
-                    ? 'bg-indigo-50 text-indigo-600 font-semibold'
-                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
-                  }
-                `}
-              >
-                <div className={`flex items-center ${isCollapsed ? 'justify-center' : 'gap-3'}`}>
-                  <Icon size={20} className={`shrink-0 ${active ? 'text-indigo-600' : 'text-slate-400'}`} />
-                  {!isCollapsed && <span>{item.name}</span>}
-                </div>
-                {!isCollapsed && item.badge && (
-                  <span className="text-[10px] tracking-wide uppercase px-1.5 py-0.5 rounded font-mono font-semibold bg-indigo-100 text-indigo-600">
-                    {item.badge}
-                  </span>
-                )}
-              </Link>
-            );
-          })}
+        <nav className="flex-1 text-sm font-medium tracking-tight w-full">
+          <ul className="space-y-1">
+            {NAV_ITEMS.map((item) => {
+              const active = isActive(pathname, item.href);
+              const Icon = item.icon;
+              return (
+                <li key={item.href}>
+                  <Link
+                    href={item.href}
+                    onClick={() => setMobileOpen(false)}
+                    aria-current={active ? 'page' : undefined}
+                    title={collapsed ? item.name : undefined}
+                    aria-label={collapsed ? item.name : undefined}
+                    className={`flex items-center justify-between py-2 rounded-lg transition-colors duration-150
+                      ${collapsed ? 'justify-center px-0 w-10 mx-auto' : 'px-3'}
+                      ${active ? 'bg-indigo-50 text-indigo-700 font-semibold' : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'}`}
+                  >
+                    <span className={`flex items-center ${collapsed ? 'justify-center' : 'gap-3'}`}>
+                      <Icon size={20} className={`shrink-0 ${active ? 'text-indigo-600' : 'text-slate-400'}`} aria-hidden="true" />
+                      {!collapsed && <span>{item.name}</span>}
+                    </span>
+                    {!collapsed && item.badge && (
+                      <span className="text-[10px] tracking-wide uppercase px-1.5 py-0.5 rounded font-semibold bg-slate-100 text-slate-500">
+                        {item.badge}
+                      </span>
+                    )}
+                  </Link>
+                </li>
+              );
+            })}
+          </ul>
         </nav>
 
-        {/* Footer Profile */}
         <div className="pt-4 border-t border-slate-200 space-y-1 w-full">
-          <div className={`flex items-center ${isCollapsed ? 'justify-center px-0' : 'gap-3 px-3'} py-2 rounded-lg text-slate-600 text-sm font-medium`}>
-            <div className="w-7 h-7 shrink-0 rounded-full bg-indigo-50 border border-indigo-200 flex items-center justify-center text-xs font-semibold text-indigo-600">
-              {userName ? userName.charAt(0).toUpperCase() : userEmail?.charAt(0).toUpperCase() || 'U'}
+          <div className={`flex items-center ${collapsed ? 'justify-center px-0' : 'gap-3 px-3'} py-2`} title={collapsed ? displayName : undefined}>
+            <div className="w-8 h-8 shrink-0 rounded-full bg-indigo-50 border border-indigo-200 flex items-center justify-center text-xs font-semibold text-indigo-700" aria-hidden="true">
+              {initial}
             </div>
-            {!isCollapsed && (
+            {!collapsed && (
               <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium text-slate-700 truncate">{userName || userEmail || 'User'}</p>
+                <p className="text-sm font-medium text-slate-800 truncate">{displayName}</p>
+                {userName && userEmail && <p className="text-xs text-slate-500 truncate">{userEmail}</p>}
               </div>
             )}
           </div>
           <button
+            type="button"
             onClick={handleSignOut}
-            title={isCollapsed ? "Sign Out" : undefined}
-            className={`w-full flex items-center ${isCollapsed ? 'justify-center px-0 w-10 mx-auto' : 'gap-3 px-3'} py-2 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-slate-100 transition-colors text-sm font-medium`}
+            disabled={signingOut}
+            title={collapsed ? 'Sign out' : undefined}
+            aria-label={collapsed ? 'Sign out' : undefined}
+            className={`w-full flex items-center ${collapsed ? 'justify-center px-0 w-10 mx-auto' : 'gap-3 px-3'} py-2 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-slate-100 transition-colors text-sm font-medium disabled:opacity-60`}
           >
-            <LogOut size={20} className="text-slate-400 shrink-0" />
-            {!isCollapsed && <span>Sign Out</span>}
+            {signingOut
+              ? <Loader2 size={20} className="text-slate-400 shrink-0 animate-spin" aria-hidden="true" />
+              : <LogOut size={20} className="text-slate-400 shrink-0" aria-hidden="true" />}
+            {!collapsed && <span>{signingOut ? 'Signing out…' : 'Sign out'}</span>}
           </button>
         </div>
       </aside>
 
-      {/* Main Content */}
-      <div className="flex-1 flex flex-col min-h-screen min-w-0">
-        {/* Top Nav Bar — matches Stitch */}
-        <header className="flex items-center h-14 px-4 md:px-6 w-full bg-white border-b border-slate-200 sticky top-0 z-30 shrink-0 gap-3">
-          {/* Mobile menu button */}
-          <button className="md:hidden text-slate-400 hover:text-slate-700 shrink-0" onClick={() => setIsMobileMenuOpen(true)}>
-            <Menu size={22} />
+      <div className="flex-1 flex flex-col min-h-0 min-w-0">
+        {/* Mobile top bar: the sidebar is off-canvas below md. */}
+        <header className="md:hidden flex items-center h-14 px-4 gap-3 bg-white border-b border-slate-200 shrink-0">
+          <button
+            type="button"
+            className="p-1.5 -ml-1.5 rounded-lg text-slate-500 hover:text-slate-800 hover:bg-slate-100"
+            onClick={() => setMobileOpen(true)}
+            aria-label="Open menu"
+            aria-controls="app-sidebar"
+            aria-expanded={mobileOpen}
+          >
+            <Menu size={22} aria-hidden="true" />
           </button>
-
-          {/* Search (desktop) */}
-          <div className="relative w-72 hidden md:block">
-            <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-            </svg>
-            <input
-              className="w-full bg-slate-50 border border-slate-200 rounded-lg pl-9 pr-3 py-1.5 text-xs text-slate-800 placeholder:text-slate-400 focus:bg-white focus:ring-1 focus:ring-indigo-600 focus:border-indigo-600 focus:outline-none transition-all"
-              placeholder="Search..."
-              type="text"
-            />
-          </div>
-
-          {/* Trailing cluster */}
-          <div className="flex items-center gap-3 ml-auto">
-            <div className="w-px h-4 bg-slate-200 mx-1 hidden md:block" />
-            <div className="flex items-center gap-2">
-              <div className="w-7 h-7 rounded-full bg-indigo-50 border border-indigo-200 flex items-center justify-center text-xs font-semibold text-indigo-600">
-                {userName ? userName.charAt(0).toUpperCase() : userEmail?.charAt(0).toUpperCase() || 'U'}
-              </div>
-              <span className="text-xs font-medium text-slate-700 hidden sm:block">
-                {userName || userEmail || 'User'}
-              </span>
-            </div>
-          </div>
+          <Link href="/boxes" aria-label="DocIntel home"><Logo size="sm" /></Link>
         </header>
 
-        {/* Page Content */}
-        <main className="flex-1 overflow-y-auto">
+        <main id="main-content" tabIndex={-1} className="flex-1 flex flex-col min-h-0 overflow-y-auto focus:outline-none">
           {children}
         </main>
       </div>

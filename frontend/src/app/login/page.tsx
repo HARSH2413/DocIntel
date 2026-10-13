@@ -2,103 +2,76 @@
 
 import React, { useState } from 'react'
 import Link from 'next/link'
+import { Eye, EyeOff } from 'lucide-react'
 import { login } from '../auth/actions'
-import { Eye, EyeOff, Sparkles } from 'lucide-react'
 import { SubmitButton } from '@/components/auth/SubmitButton'
+import { AuthShell, FormNotice, authInputClass } from '@/components/auth/AuthShell'
 import { authMessage } from '@/lib/authMessages'
+
 export default function LoginPage({
-    searchParams,
-  }: {
-    searchParams: Promise<{ error?: string, success?: string }>
-  }) {
-  const params = React.use(searchParams);
-  const [showPassword, setShowPassword] = useState(false);
-  
+  searchParams,
+}: {
+  searchParams: Promise<{ error?: string, success?: string, next?: string }>
+}) {
+  const params = React.use(searchParams)
+  const [showPassword, setShowPassword] = useState(false)
+  const error = authMessage(params?.error)
+  const success = authMessage(params?.success)
+
   return (
-    <div className="min-h-screen bg-[#f8fafc] flex flex-col items-center justify-center p-4 selection:bg-indigo-100 selection:text-indigo-900">
-      <Link href="/" className="absolute top-8 left-8 text-slate-500 hover:text-slate-900 transition-colors font-medium text-sm">
-        ← Back to home
-      </Link>
-      
-      <div className="w-full max-w-md bg-white border border-slate-200 p-8 rounded-2xl shadow-xl shadow-slate-200/50">
-        <div className="flex flex-col items-center mb-8">
-          <div className="w-12 h-12 rounded-xl bg-indigo-50 border border-indigo-100 flex items-center justify-center mb-4">
-            <Sparkles className="w-6 h-6 text-indigo-600" />
-          </div>
-          <h2 className="text-2xl font-bold text-slate-900 font-headline tracking-tight">Welcome back</h2>
-          <p className="text-slate-500 text-sm mt-1.5">Log in to your workspace</p>
+    <AuthShell
+      title="Welcome back"
+      subtitle="Log in to your DocIntel account"
+      footer={<>Don&apos;t have an account?{' '}<Link href="/signup" className="text-indigo-600 hover:text-indigo-700 font-semibold">Create one</Link></>}
+    >
+      <form action={login} className="flex flex-col gap-4">
+        {/* Where to return after sign-in; validated server-side to same-site paths only. */}
+        <input type="hidden" name="next" value={params?.next ?? ''} />
+
+        {error && <FormNotice tone="error">{error}</FormNotice>}
+        {success && <FormNotice tone="success">{success}</FormNotice>}
+
+        <div className="flex flex-col gap-2">
+          <label className="text-sm text-slate-700 font-semibold" htmlFor="email">Email</label>
+          <input
+            id="email"
+            name="email"
+            className={authInputClass}
+            placeholder="you@example.com"
+            type="email"
+            autoComplete="email"
+            required
+            aria-invalid={error ? true : undefined}
+          />
         </div>
 
-
-
-        <form action={login} className="flex flex-col gap-4">
-          <div className="flex flex-col gap-2">
-            <label className="text-sm text-slate-700 font-semibold tracking-tight" htmlFor="email">
-              Email
-            </label>
+        <div className="flex flex-col gap-2">
+          <label className="text-sm text-slate-700 font-semibold" htmlFor="password">Password</label>
+          <div className="relative">
             <input
-              id="email"
-              name="email"
-              className="px-4 py-2.5 bg-white border border-slate-300 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 transition-all text-sm shadow-sm"
-              placeholder="you@example.com"
-              type="email"
-              autoComplete="email"
+              id="password"
+              name="password"
+              className={`${authInputClass} pr-12`}
+              placeholder="Your password"
+              type={showPassword ? 'text' : 'password'}
+              autoComplete="current-password"
               required
+              aria-invalid={error ? true : undefined}
             />
+            <button
+              type="button"
+              onClick={() => setShowPassword(s => !s)}
+              className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 rounded text-slate-400 hover:text-slate-600"
+              aria-label={showPassword ? 'Hide password' : 'Show password'}
+              aria-pressed={showPassword}
+            >
+              {showPassword ? <EyeOff className="w-4 h-4" aria-hidden="true" /> : <Eye className="w-4 h-4" aria-hidden="true" />}
+            </button>
           </div>
-
-          <div className="flex flex-col gap-2 relative">
-            <div className="flex justify-between items-center">
-              <label className="text-sm text-slate-700 font-semibold tracking-tight" htmlFor="password">
-                Password
-              </label>
-            </div>
-            
-            <div className="relative">
-              <input
-                id="password"
-                name="password"
-                className="w-full px-4 py-2.5 bg-white border border-slate-300 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 transition-all pr-12 text-sm shadow-sm"
-                placeholder="••••••••"
-                type={showPassword ? "text" : "password"}
-                autoComplete="current-password"
-                required
-              />
-              <button 
-                type="button"
-                onClick={() => setShowPassword(!showPassword)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
-                aria-label={showPassword ? "Hide password" : "Show password"}
-              >
-                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-              </button>
-            </div>
-          </div>
-
-          {authMessage(params?.error) && (
-            <div className="text-sm text-red-600 bg-red-50 p-3 rounded-lg text-center border border-red-200">
-              {authMessage(params?.error)}
-            </div>
-          )}
-
-          {authMessage(params?.success) && (
-            <div className="text-sm text-emerald-700 bg-emerald-50 p-3 rounded-lg text-center border border-emerald-200">
-              {authMessage(params?.success)}
-            </div>
-          )}
-
-          <div className="mt-2">
-            <SubmitButton text="Log In" loadingText="Logging in..." />
-          </div>
-        </form>
-
-        <div className="mt-8 text-center text-sm text-slate-500">
-          Don&apos;t have an account?{' '}
-          <Link href="/signup" className="text-indigo-600 hover:text-indigo-700 font-semibold transition-colors">
-            Create account
-          </Link>
         </div>
-      </div>
-    </div>
+
+        <SubmitButton text="Log in" loadingText="Logging in…" />
+      </form>
+    </AuthShell>
   )
 }

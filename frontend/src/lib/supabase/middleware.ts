@@ -32,13 +32,15 @@ export async function updateSession(request: NextRequest) {
 
   // Protection logic:
   // Redirect unauthenticated users away from private routes
-  const isProtectedRoute = 
-    request.nextUrl.pathname.startsWith('/boxes') || 
-    request.nextUrl.pathname.startsWith('/onboarding')
-  
+  const PROTECTED_PREFIXES = ['/boxes', '/onboarding', '/settings', '/knowledge-base', '/workspace']
+  const isProtectedRoute = PROTECTED_PREFIXES.some(prefix => request.nextUrl.pathname.startsWith(prefix))
+
   if (!user && isProtectedRoute) {
     const url = request.nextUrl.clone()
     url.pathname = '/login'
+    // Bring the user back to the page they asked for after signing in.
+    url.search = ''
+    url.searchParams.set('next', request.nextUrl.pathname + request.nextUrl.search)
     return NextResponse.redirect(url)
   }
 

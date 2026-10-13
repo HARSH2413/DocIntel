@@ -45,6 +45,10 @@ def get_documents(
         raise HTTPException(status_code=403, detail="Access denied to this Box.")
     try:
         documents = ingestion_service.db.get_document_metadata(box_id=box_id)
+        # A server restart mid-ingestion leaves documents 'processing' forever; surface them as failed.
+        if any(ingestion_service.is_stale_processing(d) for d in documents):
+            ingestion_service.fail_stale_documents(box_id)
+            documents = ingestion_service.db.get_document_metadata(box_id=box_id)
         return {"status": "success", "data": documents}
     except Exception as e:
         logger.exception(f"Document list failed: {e}")

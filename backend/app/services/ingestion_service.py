@@ -31,9 +31,11 @@ class UserFacingIngestionError(ValueError):
     pass
 
 import gc
+import io
 import os
 import time
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from app.interfaces.vector_store import IVectorStore
@@ -46,6 +48,8 @@ from app.services.hierarchical_chunking import HierarchicalChunker
 PDF_PAGE_BATCH_SIZE = 20
 
 _PLACEHOLDER_SECTIONS = {"", "Document", "Dataset", "Workbook"}
+
+STALE_PROCESSING_MESSAGE = "Processing was interrupted before it finished. Please upload the document again."
 
 
 def _embedding_header(filename: str, section: Optional[str]) -> str:
@@ -61,6 +65,76 @@ def _embedding_header(filename: str, section: Optional[str]) -> str:
     return f"[Document: {filename} | Section: {section}]"
 
 
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+# Share of a DOCX body's characters that must reach the extracted text.
+DOCX_MIN_TEXT_COVERAGE = 0.98
+
+
+# Bidi embeddings, overrides and isolates. Some exporters (e.g. Google Docs → PDF) wrap every
+# word in LRO…PDF (U+202D…U+202C) instead of writing spaces, so these mark word boundaries:
+# deleting them glued whole documents into "aretermedfundamentalforareason".
+_BIDI_CONTROLS = re.compile(r"[‪-‮⁦-⁩]+")
+# Invisible characters that sit inside words: zero-width (non-)joiners/spaces, direction
+# marks, BOM, soft hyphen.
+_INVISIBLE_IN_WORD = re.compile(r"[​-‏⁠﻿­]")
+
+
+def _clean_extracted_text(text: str) -> str:
+    return _INVISIBLE_IN_WORD.sub("", _BIDI_CONTROLS.sub(" ", text))
+
+
+def _docx_text(element) -> str:
+    """All visible text under a WordprocessingML element.
+
+    python-docx's `.text` reads only a paragraph's direct runs, so text in tracked
+    insertions, text boxes and content controls was silently dropped. Deleted text
+    (w:delText) and field codes (w:instrText) are different tags and stay excluded.
+    mc:Fallback repeats its mc:Choice sibling for old readers, so it is skipped.
+    """
+    parts = []
+    for node in element.iter(f"{_W}t", f"{_W}tab", f"{_W}br", f"{_W}p"):
+        if any(a.tag == _MC_FALLBACK for a in node.iterancestors()):
+            continue
+        if node.tag == f"{_W}t":
+            parts.append(node.text or "")
+        elif node.tag == f"{_W}p":
+            if node is not element:
+                parts.append("\n")
+        elif node.getparent().tag == f"{_W}r":  # w:tab also appears as a tab-stop definition
+            parts.append("\t" if node.tag == f"{_W}tab" else "\n")
+    return "".join(parts)
+
+
+def _visible_char_count(text: str) -> int:
+    return sum(1 for ch in text if not ch.isspace())
+
+
+def _read_text_file(file_path: str) -> str:
+    """Decode a TXT/CSV upload strictly.
+
+    Decoding with errors="replace" made UTF-16 files (accepted at upload) and
+    Windows-1252 exports "succeed" as unreadable text, so try the likely encodings
+    and fail clearly when none fits.
+    """
+    with open(file_path, "rb") as f:
+        data = f.read()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    try:
+        text = data.decode("cp1252")
+        logger.warning(f"'{os.path.basename(file_path)}' is not UTF-8; decoded as Windows-1252")
+        return text
+    except UnicodeDecodeError:
+        raise UserFacingIngestionError(
+            "The text encoding of this file could not be recognised. Save it as UTF-8 and upload it again."
+        )
+
+
 class IngestionService:
     def __init__(
         self,
@@ -70,11 +144,13 @@ class IngestionService:
         chunk_size: int = 1000,
         chunk_overlap: int = 300,
         batch_size: int = 50,
+        stale_processing_minutes: int = 60,
     ):
         self.db = db
         self.lexical_store = lexical_store
         self.embedder = embedder
         self.batch_size = batch_size
+        self.stale_processing_minutes = stale_processing_minutes
         self.hierarchical_chunker = HierarchicalChunker(chunk_size=chunk_size)
         # Heading-aware separators — respects document structure before fixed-size splits
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -105,13 +181,18 @@ class IngestionService:
             file_type = self._detect_file_type(filename)
 
             if filename_lower.endswith(".pdf"):
-                self._process_pdf_streaming(file_path, filename, file_hash, box_id, document_id, file_type)
+                expected_chunks = self._process_pdf_streaming(file_path, filename, file_hash, box_id, document_id, file_type)
             else:
-                self._process_small_file(file_path, filename, file_hash, box_id, document_id, file_type)
+                expected_chunks = self._process_small_file(file_path, filename, file_hash, box_id, document_id, file_type)
 
-            # Successfully completed ingestion
+            # "No exception" is not proof of completeness: confirm every chunk is in the DB.
+            stored_chunks = self.db.count_document_chunks(document_id)
+            if stored_chunks != expected_chunks:
+                raise PartialIngestionError(
+                    f"Stored chunk count mismatch for {document_id}: expected {expected_chunks}, found {stored_chunks}"
+                )
+
             self.db.update_document_status(document_id, "completed")
-            self.lexical_store.invalidate_box(box_id)
 
         except DocumentDeletedError as e:
             logger.warning(f"Ingestion aborted for '{filename}': Document was deleted by the user.")
@@ -124,6 +205,13 @@ class IngestionService:
             except Exception as cleanup_e:
                 logger.error(f"Failed to clean up partial chunks for {document_id}: {cleanup_e}")
             raise e
+        else:
+            # Outside the try: a cache-invalidation failure must never delete stored chunks.
+            # The lexical index also re-checks the DB on its own, so a miss here is only a delay.
+            try:
+                self.lexical_store.invalidate_box(box_id)
+            except Exception as e:
+                logger.error(f"Failed to invalidate lexical index for box {box_id}: {e}")
         finally:
             if os.path.exists(file_path):
                 try:
@@ -142,6 +230,7 @@ class IngestionService:
     
             total_chunks_saved = 0
             failed_batches = 0
+            empty_pages = 0
             global_chunk_index = 1
             
             # Metrics
@@ -173,13 +262,16 @@ class IngestionService:
                     page = doc.load_page(page_num)
                     blocks = page.get_text("blocks")
                     blocks = sort_blocks_column_aware(blocks, page_rotation=getattr(page, 'rotation', 0))
+                    blocks = [(*b[:4], _clean_extracted_text(b[4]), *b[5:]) if len(b) >= 7 else b for b in blocks]
                     page_text = "\n".join(b[4] for b in blocks if len(b) >= 7 and b[6] == 0)
-                    
-                    # Normalize text: fold case, strip glyphs, collapse whitespace but preserve newlines
+
+                    # Normalize text: fold case, strip bullet glyphs, collapse whitespace but preserve newlines
                     page_text = page_text.lower()
-                    page_text = re.sub(r'[\u25a0-\u25ff\u2022\u202d\u202c]', '', page_text)
+                    page_text = re.sub(r'[\u25a0-\u25ff\u2022]', '', page_text)
                     page_text = re.sub(r'[ \t]+', ' ', page_text).strip()
-                    
+                    if not page_text:
+                        empty_pages += 1
+
                     
                     # Heuristic for section title if TOC is missing
                     if not page_to_section.get(page_num + 1):
@@ -349,7 +441,7 @@ class IngestionService:
         
         logger.info(
             f"INGESTION AUDIT [{filename}]: "
-            f"Pages={total_pages} | Chunks={total_chunks_saved} | EmbedBatches={total_embed_batches} | AvgBatch={avg_batch:.1f} || "
+            f"Pages={total_pages} | EmptyPages={empty_pages} | Chunks={total_chunks_saved} | EmbedBatches={total_embed_batches} | AvgBatch={avg_batch:.1f} || "
             f"Time: Total={t_total:.2f}s | Extract={t_extract:.2f}s | Split={t_split:.2f}s | Embed={t_embed:.2f}s | DB={t_db:.2f}s"
         )
 
@@ -359,8 +451,9 @@ class IngestionService:
         if failed_batches > 0:
             logger.warning(f"Completed '{filename}' with {failed_batches} failed batches | {total_chunks_saved} chunks")
             raise PartialIngestionError(f"Completed with {failed_batches} failed batches | {total_chunks_saved} chunks saved")
-        else:
-            logger.info(f"Successfully ingested '{filename}' | {total_pages} pages → {total_chunks_saved} chunks")
+
+        logger.info(f"Successfully ingested '{filename}' | {total_pages} pages → {total_chunks_saved} chunks")
+        return total_chunks_saved
 
     def _process_small_file(self, file_path: str, filename: str, file_hash: str, box_id: str, document_id: str, file_type: str = "Document"):
         """Standard processing for DOCX, TXT, CSV, and XLSX files."""
@@ -369,7 +462,7 @@ class IngestionService:
         t_db = 0.0
         
         t0 = time.perf_counter()
-        raw_text = self._extract_text_from_disk(file_path, filename)
+        raw_text = _clean_extracted_text(self._extract_text_from_disk(file_path, filename))
         t_extract = time.perf_counter() - t0
         logger.info(f"Extracted text from '{filename}' ({len(raw_text)} chars)")
 
@@ -459,8 +552,28 @@ class IngestionService:
         if failed_batches > 0:
             logger.warning(f"Completed '{filename}' with {failed_batches}/{total_batches} failed batches")
             raise PartialIngestionError(f"Completed with {failed_batches}/{total_batches} failed batches")
-        else:
-            logger.info(f"Successfully ingested '{filename}' ({total_batches} batches)")
+
+        logger.info(f"Successfully ingested '{filename}' ({total_batches} batches)")
+        return total_chunks
+
+    def is_stale_processing(self, document: dict) -> bool:
+        """True for a document still 'processing' long after upload, i.e. abandoned by a server restart."""
+        if document.get("status") != "processing":
+            return False
+        try:
+            created_at = datetime.fromisoformat(document["created_at"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - created_at > timedelta(minutes=self.stale_processing_minutes)
+
+    def fail_stale_documents(self, box_id: Optional[str] = None) -> int:
+        """Marks abandoned 'processing' documents as failed so users can see and retry them."""
+        count = self.db.fail_stale_processing_documents(self.stale_processing_minutes, STALE_PROCESSING_MESSAGE, box_id)
+        if count:
+            logger.warning(f"Marked {count} abandoned 'processing' document(s) as failed")
+        return count
 
     def delete_document(self, document_id: str, box_id: str) -> bool:
         """Deletes a document and cascades to chunks."""
@@ -510,8 +623,7 @@ class IngestionService:
             return self._extract_docx(file_path)
 
         elif filename_lower.endswith(".txt"):
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
+            return _read_text_file(file_path)
 
         elif filename_lower.endswith(".csv"):
             return self._extract_csv(file_path)
@@ -528,38 +640,87 @@ class IngestionService:
         """
         try:
             import docx
-            from docx.oxml.table import CT_Tbl
-            from docx.oxml.text.paragraph import CT_P
+            from docx.opc.constants import RELATIONSHIP_TYPE as RT
+            from docx.oxml import parse_xml
             from docx.table import Table
             from docx.text.paragraph import Paragraph
 
             doc_file = docx.Document(file_path)
+            body = doc_file.element.body
             content = []
 
-            for child in doc_file.element.body:
-                if isinstance(child, CT_P):
-                    paragraph = Paragraph(child, doc_file)
-                    if paragraph.text.strip():
+            def walk(container):
+                for child in container.iterchildren():
+                    if child.tag == f"{_W}p":
+                        text = _docx_text(child).strip()
+                        if not text:
+                            continue
+                        paragraph = Paragraph(child, doc_file)
                         style_name = paragraph.style.name if paragraph.style else ""
                         if style_name.startswith("Heading"):
                             try:
                                 level = int(style_name.split()[-1])
-                                prefix = "#" * level
-                                content.append(f"{prefix} {paragraph.text.strip()}")
+                                content.append(f"{'#' * level} {text}")
                             except ValueError:
-                                content.append(f"## {paragraph.text.strip()}")
+                                content.append(f"## {text}")
                         else:
-                            content.append(paragraph.text.strip())
-                elif isinstance(child, CT_Tbl):
-                    table = Table(child, doc_file)
-                    content.append("[TABLE]")
-                    for row in table.rows:
-                        # Keep empty cells so we don't shift columns
-                        row_text = " | ".join(cell.text.strip().replace("\n", " ") for cell in row.cells)
-                        if row_text.strip(" |"):
-                            content.append(row_text)
+                            content.append(text)
+                    elif child.tag == f"{_W}tbl":
+                        table = Table(child, doc_file)
+                        content.append("[TABLE]")
+                        for row in table.rows:
+                            # Keep empty cells so we don't shift columns
+                            row_text = " | ".join(_docx_text(cell._tc).strip().replace("\n", " ") for cell in row.cells)
+                            if row_text.strip(" |"):
+                                content.append(row_text)
+                    else:
+                        # Content controls (w:sdt), custom XML and similar wrappers hold
+                        # ordinary paragraphs and tables; descend instead of skipping them.
+                        walk(child)
+
+            walk(body)
+
+            # Safety net: every character of body text must have made it into the output.
+            expected_chars = _visible_char_count(_docx_text(body))
+            extracted_chars = _visible_char_count("".join(content))
+            if extracted_chars < expected_chars * DOCX_MIN_TEXT_COVERAGE:
+                logger.error(f"DOCX extraction captured {extracted_chars}/{expected_chars} characters")
+                raise UserFacingIngestionError(
+                    "Part of this document's text is stored in a layout that could not be read, so it "
+                    "cannot be fully searched. Try saving it again as a standard .docx and re-uploading."
+                )
+
+            # Headers/footers and foot/endnotes live in separate parts of the package.
+            notes, margins = [], []
+            for rel in doc_file.part.rels.values():
+                if rel.is_external or rel.reltype not in (RT.HEADER, RT.FOOTER, RT.FOOTNOTES, RT.ENDNOTES):
+                    continue
+                part = rel.target_part
+                root = getattr(part, "element", None)
+                if root is None:
+                    root = parse_xml(part.blob)
+                if rel.reltype in (RT.HEADER, RT.FOOTER):
+                    text = _docx_text(root).strip()
+                    if text and text not in margins:
+                        margins.append(text)
+                    continue
+                for note in root.iterchildren(f"{_W}footnote", f"{_W}endnote"):
+                    # Typed notes are separators, not content.
+                    if note.get(f"{_W}type") is None:
+                        text = " ".join(_docx_text(note).split())
+                        if text:
+                            notes.append(text)
+
+            if notes:
+                content.append("## Notes")
+                content.extend(notes)
+            if margins:
+                content.append("## Headers and Footers")
+                content.extend(margins)
 
             return "\n\n".join(content)
+        except UserFacingIngestionError:
+            raise
         except Exception as e:
             logger.error(f"DOCX extraction failed: {e}")
             raise
@@ -571,21 +732,20 @@ class IngestionService:
         Each row becomes: "Column1: value1 | Column2: value2 | ..."
         This makes the data semantically searchable.
         """
+        text = _read_text_file(file_path)
         rows = []
         try:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    row_text = " | ".join(
-                        f"{key}: {value}" for key, value in row.items()
-                        if value and value.strip()
-                    )
-                    if row_text:
-                        rows.append(row_text)
+            reader = csv.DictReader(io.StringIO(text, newline=""))
+            for row in reader:
+                row_text = " | ".join(
+                    f"{key}: {value}" for key, value in row.items()
+                    if value and value.strip()
+                )
+                if row_text:
+                    rows.append(row_text)
         except Exception as e:
-            logger.warning(f"CSV DictReader failed, falling back to raw read: {e}")
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
+            logger.warning(f"CSV DictReader failed, falling back to raw text: {e}")
+            return text
 
         return "\n".join(rows)
 
@@ -597,35 +757,56 @@ class IngestionService:
         """
         try:
             from openpyxl import load_workbook
+            # data_only gives each formula's value as last saved by Excel. Files written by
+            # other software often have no saved value, so the raw workbook is read in step
+            # to tell a genuinely empty cell from a formula whose value is missing.
             wb = load_workbook(file_path, read_only=True, data_only=True)
-            all_text = []
+            raw_wb = load_workbook(file_path, read_only=True, data_only=False)
+            try:
+                all_text = []
+                missing_values = 0
 
-            for sheet_name in wb.sheetnames:
-                ws = wb[sheet_name]
-                all_text.append(f"--- Sheet: {sheet_name} ---")
+                for sheet_name in wb.sheetnames:
+                    all_text.append(f"--- Sheet: {sheet_name} ---")
 
-                # Iterate without casting to list to save memory
-                rows_iter = ws.iter_rows(values_only=True)
-                try:
-                    first_row = next(rows_iter)
-                except StopIteration:
-                    continue
-
-                # Use first row as headers
-                headers = [str(h) if h else f"Col{i}" for i, h in enumerate(first_row)]
-
-                for row in rows_iter:
-                    row_text = " | ".join(
-                        f"{headers[i]}: {str(cell)}"
-                        for i, cell in enumerate(row)
-                        if cell is not None and str(cell).strip()
+                    # Iterate without casting to list to save memory
+                    rows_iter = zip(
+                        wb[sheet_name].iter_rows(values_only=True),
+                        raw_wb[sheet_name].iter_rows(values_only=True),
                     )
-                    if row_text:
-                        all_text.append(row_text)
+                    try:
+                        first_row, _ = next(rows_iter)
+                    except StopIteration:
+                        continue
 
-            wb.close()
+                    # Use first row as headers
+                    headers = [str(h) if h else f"Col{i}" for i, h in enumerate(first_row)]
+
+                    for row, raw_row in rows_iter:
+                        cells = []
+                        for i, cell in enumerate(row):
+                            if cell is None:
+                                if i < len(raw_row) and raw_row[i] is not None:
+                                    missing_values += 1
+                                continue
+                            if str(cell).strip():
+                                header = headers[i] if i < len(headers) else f"Col{i}"
+                                cells.append(f"{header}: {cell}")
+                        if cells:
+                            all_text.append(" | ".join(cells))
+            finally:
+                wb.close()
+                raw_wb.close()
+
+            if missing_values:
+                raise UserFacingIngestionError(
+                    f"{missing_values} formula cells in this spreadsheet have no saved values, so their "
+                    "data cannot be read. Open the file in Excel, save it, and upload it again."
+                )
             return "\n".join(all_text)
 
+        except UserFacingIngestionError:
+            raise
         except ImportError:
             logger.warning("openpyxl not installed, cannot process XLSX files")
             raise ValueError("XLSX support requires openpyxl: pip install openpyxl")

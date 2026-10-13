@@ -28,7 +28,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Security(securi
         db = _get_db_adapter()
         # This calls Supabase's auth service, verifying the token securely via Supabase's own API
         # This automatically handles asymmetric keys (ES256, RS256) and symmetric keys (HS256)
-        user_resp = db.client.auth.get_user(token)
+        user_resp = db.get_auth_user(token)
         
         if not user_resp or not user_resp.user:
             raise HTTPException(status_code=401, detail="Invalid token")
@@ -57,10 +57,10 @@ def verify_box_access(box_id: str, user_id: str) -> dict:
     """
     db = _get_db_adapter()
     try:
-        result = db.client.table("boxes").select("*").eq("id", box_id).eq("user_id", user_id).execute()
-        if not result.data:
+        box = db.get_box_for_user(box_id, user_id)
+        if not box:
             raise HTTPException(status_code=404, detail="Box not found or unauthorized")
-        return result.data[0]
+        return box
     except HTTPException:
         raise
     except Exception as e:

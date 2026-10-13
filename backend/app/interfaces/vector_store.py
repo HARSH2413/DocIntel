@@ -44,6 +44,16 @@ class IVectorStore(ABC):
         pass
 
     @abstractmethod
+    def count_document_chunks(self, document_id: str) -> int:
+        """Number of chunks stored for a document, used to verify ingestion completeness."""
+        pass
+
+    @abstractmethod
+    def fail_stale_processing_documents(self, older_than_minutes: int, error_message: str, box_id: Optional[str] = None) -> int:
+        """Marks documents stuck in 'processing' longer than the cutoff as failed. Returns how many."""
+        pass
+
+    @abstractmethod
     def count_documents(self, box_id: str) -> int:
         """Number of documents in a box, used for upload quotas."""
         pass

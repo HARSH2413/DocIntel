@@ -2,6 +2,8 @@ import { redirect } from 'next/navigation'
 import { createClient } from '@/lib/supabase/server'
 import BoxesClient from './BoxesClient'
 
+export const metadata = { title: 'Dashboard' }
+
 export default async function BoxesPage() {
   const supabase = await createClient()
   

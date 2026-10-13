@@ -2,23 +2,22 @@ import { redirect } from 'next/navigation'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase/server'
 import { API_URL } from '@/lib/config'
-import SecureBrainDashboard from '@/app/workspace/chat/ChatDashboard'
+import { StatusPage, statusLinkStyles } from '@/components/ui/StatusPage'
+import ChatDashboard from '@/app/workspace/chat/ChatDashboard'
 
 export default async function BoxChatPage({ params }: { params: Promise<{ box_id: string }> }) {
   const supabase = await createClient()
-  
-  const { data: { session } } = await supabase.auth.getSession()
-  
-  if (!session || !session.access_token) {
-      redirect('/login')
-  }
 
+  const { data: { session } } = await supabase.auth.getSession()
   const { box_id: boxId } = await params;
 
+  if (!session || !session.access_token) {
+      redirect(`/login?next=${encodeURIComponent(`/boxes/${boxId}`)}`)
+  }
+
   // Fetch the box using the backend API
-  let box = null;
-  let errorDetails = null;
-  let statusCode = null;
+  let box: { name: string } | null = null;
+  let statusCode: number | null = null;
 
   try {
       const res = await fetch(`${API_URL}/api/v1/boxes/${boxId}`, {
@@ -27,43 +26,40 @@ export default async function BoxChatPage({ params }: { params: Promise<{ box_id
           },
           cache: 'no-store'
       });
-      
+
       statusCode = res.status;
-      
+
       if (res.ok) {
           const json = await res.json();
           box = json.data;
       } else {
-          errorDetails = await res.text();
-          console.error(`Box fetch failed: ${res.status} ${res.statusText} - ${errorDetails}`);
+          console.error(`Box fetch failed: ${res.status} ${res.statusText} - ${await res.text()}`);
       }
   } catch (err) {
       console.error("Network Error fetching box:", err);
-      errorDetails = String(err);
   }
 
   if (!box) {
-      // Box doesn't exist or user doesn't have access
+      // 403 and 404 look the same on purpose: don't reveal whether someone else's box exists.
+      const missing = statusCode === 404 || statusCode === 403
       return (
-        <div className="flex h-full items-center justify-center bg-slate-50 text-center">
-            <div>
-                <h1 className="text-2xl font-bold text-slate-800 mb-2">
-                    {statusCode === 404 ? "Box Not Found" : "Unable to Load Box"}
-                </h1>
-                <p className="text-slate-500 mb-6">
-                    {statusCode === 404 
-                        ? "The box you are looking for does not exist or you do not have permission to access it."
-                        : `We encountered a server error while loading this box (HTTP ${statusCode || 'Unknown'}). Please try again later.`}
-                </p>
-                <Link href="/boxes" className="px-4 py-2 bg-indigo-600 text-white rounded-xl font-bold hover:bg-indigo-700 transition-colors">
-                    Back to Boxes
-                </Link>
-            </div>
-        </div>
+        <StatusPage
+          eyebrow={missing ? undefined : 'Connection problem'}
+          title={missing ? 'Box not found' : 'Couldn’t load this box'}
+          description={missing
+            ? 'This box doesn’t exist, was deleted, or belongs to another account.'
+            : 'The server didn’t respond as expected. Check your connection and try again in a moment.'}
+          actions={
+            <>
+              {!missing && <Link href={`/boxes/${boxId}`} className={statusLinkStyles.primary}>Try again</Link>}
+              <Link href="/boxes/all" className={missing ? statusLinkStyles.primary : statusLinkStyles.secondary}>Go to my boxes</Link>
+            </>
+          }
+        />
       )
   }
 
   return (
-    <SecureBrainDashboard boxId={boxId} boxName={box.name} />
+    <ChatDashboard boxId={boxId} boxName={box.name} />
   )
 }

@@ -182,11 +182,18 @@ async def upload_document(
         except Exception as e:
             err_str = str(e).lower()
             if "unique" in err_str or "duplicate" in err_str or "23505" in err_str:
-                # Check if it's a failed document we can overwrite
+                # Check if it's a failed (or abandoned mid-ingestion) document we can overwrite
                 existing = await run_in_threadpool(ingestion_service.db.get_document_metadata, box_id)
-                failed_doc = next((d for d in existing if d.get("file_hash") == file_hash and d.get("status") == "failed"), None)
+                failed_doc = next(
+                    (
+                        d for d in existing
+                        if d.get("file_hash") == file_hash
+                        and (d.get("status") == "failed" or ingestion_service.is_stale_processing(d))
+                    ),
+                    None,
+                )
                 if failed_doc:
-                    logger.info(f"Retrying failed document {failed_doc['id']}.")
+                    logger.info(f"Retrying {failed_doc.get('status')} document {failed_doc['id']}.")
                     await run_in_threadpool(ingestion_service.db.delete_document, document_id=failed_doc["id"], box_id=box_id)
                     document_id = await run_in_threadpool(
                         ingestion_service.db.create_document,
@@ -257,8 +264,6 @@ def _process_upload_safely(
                 box_id=box_id,
                 document_id=document_id,
             )
-        from app.core.cache import global_query_cache
-        global_query_cache.invalidate_box(box_id)
     except Exception as e:
         # This is deliberately a final boundary around the background task.
         # The service already logs detailed extraction/batch failures.
@@ -267,5 +272,12 @@ def _process_upload_safely(
             ingestion_service.db.update_document_status(document_id, "failed", _user_safe_error(e))
         except Exception as db_e:
             logger.exception(f"Failed to update document {document_id} status to failed: {db_e}")
+    else:
+        # Outside the try: a cache failure must not mark a completed document as failed.
+        try:
+            from app.core.cache import global_query_cache
+            global_query_cache.invalidate_box(box_id)
+        except Exception:
+            logger.exception(f"Failed to invalidate query cache for box {box_id}")
     finally:
         _release_ingestion_slot()

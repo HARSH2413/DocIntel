@@ -79,3 +79,32 @@ def test_successful_request_no_retry(adapter, mock_supabase_client):
     
     assert result == "doc-4"
     assert mock_execute.call_count == 1
+
+def test_client_uses_http1(mock_supabase_client):
+    with patch('app.infrastructure.supabase_adapter.httpx.Client') as mock_http_client, \
+         patch('app.infrastructure.supabase_adapter.create_client') as mock_create:
+        SupabaseAdapter("http://localhost", "dummy_key")
+
+    assert mock_http_client.call_args.kwargs["http2"] is False
+    assert mock_create.call_args.kwargs["options"].httpx_client is mock_http_client.return_value
+
+def test_box_access_check_retries_server_disconnect(adapter, mock_supabase_client):
+    mock_execute = MagicMock(side_effect=[
+        httpx.RemoteProtocolError("Server disconnected"),
+        MagicMock(data=[{"id": "box-1"}]),
+    ])
+    mock_supabase_client.table().select().eq().eq().execute = mock_execute
+
+    assert adapter.get_box_for_user("box-1", "user-1") == {"id": "box-1"}
+    assert mock_execute.call_count == 2
+
+def test_box_access_check_returns_none_for_foreign_box(adapter, mock_supabase_client):
+    mock_supabase_client.table().select().eq().eq().execute.return_value = MagicMock(data=[])
+    assert adapter.get_box_for_user("box-1", "intruder") is None
+
+def test_auth_user_lookup_retries_connection_reset(adapter, mock_supabase_client):
+    user_resp = MagicMock()
+    mock_supabase_client.auth.get_user.side_effect = [httpx.ReadError("connection reset"), user_resp]
+
+    assert adapter.get_auth_user("token") is user_resp
+    assert mock_supabase_client.auth.get_user.call_count == 2

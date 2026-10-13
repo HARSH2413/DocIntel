@@ -3,8 +3,8 @@
 :root {
   --background: #f8fafc;
   --foreground: #0f172a;
-  --font-headline: 'Hanken Grotesk', sans-serif;
-  --font-body: 'Inter', var(--font-inter), sans-serif;
+  --font-headline: var(--font-hanken), ui-sans-serif, system-ui, sans-serif;
+  --font-body: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
 }
 
 @theme inline {
@@ -90,7 +90,14 @@ body {
 
 /* Headline font utility */
 .font-headline {
-  font-family: 'Hanken Grotesk', sans-serif;
+  font-family: var(--font-headline);
+}
+
+/* Visible keyboard focus everywhere (WCAG 2.4.7). Elements that draw their own
+   focus ring with `focus:ring-*` opt out via `focus:outline-none`. */
+:focus-visible {
+  outline: 2px solid #4f46e5;
+  outline-offset: 2px;
 }
 
 @media (prefers-reduced-motion: reduce) {

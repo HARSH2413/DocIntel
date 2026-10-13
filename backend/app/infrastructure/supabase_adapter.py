@@ -5,8 +5,10 @@ Wraps every call with tenacity retries so transient network errors
 (connection resets, timeouts) don't crash the entire request.
 """
 import httpx
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from supabase import create_client, Client
+from supabase.lib.client_options import SyncClientOptions
 from postgrest.exceptions import APIError
 from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception
 from app.interfaces.vector_store import IVectorStore
@@ -21,6 +23,9 @@ RETRYABLE_EXCEPTIONS = (
     httpx.ConnectError,
     httpx.ReadTimeout,
     httpx.ConnectTimeout,
+    httpx.RemoteProtocolError,  # "Server disconnected": Supabase closed a pooled connection
+    httpx.ReadError,            # connection reset while reading (WinError 10054 on Windows)
+    httpx.WriteError,           # connection dropped before the request was fully sent
 )
 
 def is_transient_error(e: BaseException) -> bool:
@@ -48,7 +53,17 @@ class SupabaseAdapter(IVectorStore):
     def __init__(self, url: str, service_key: str, max_retries: int = 3):
         if not url or not service_key:
             raise ValueError("Missing Supabase credentials — set SUPABASE_URL and SUPABASE_SERVICE_KEY in .env")
-        self.client: Client = create_client(url, service_key)
+        # HTTP/1.1 instead of the SDK's default HTTP/2. A sync HTTP/2 client funnels every
+        # request thread through one shared connection, so when Supabase closes it while idle,
+        # every in-flight request fails at once with "Server disconnected". With HTTP/1.1 each
+        # request gets its own pooled connection, and httpx checks it is alive before reuse.
+        http_client = httpx.Client(
+            http2=False,
+            timeout=settings.REQUEST_TIMEOUT,
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+        self.client: Client = create_client(url, service_key, options=SyncClientOptions(httpx_client=http_client))
         self.max_retries = max_retries
         logger.info("Supabase adapter initialized")
 
@@ -140,6 +155,42 @@ class SupabaseAdapter(IVectorStore):
     def delete_chunks_by_document(self, document_id: str) -> None:
         """Deletes all chunks belonging to a specific document without deleting the document itself."""
         self.client.table("document_chunks").delete().eq("document_id", document_id).execute()
+
+    @retry(
+        stop=stop_after_attempt(settings.DB_MAX_RETRIES),
+        wait=wait_random_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(is_transient_error),
+        before_sleep=lambda rs: logger.warning(f"Supabase count_document_chunks retry (attempt {rs.attempt_number})"),
+    )
+    def count_document_chunks(self, document_id: str) -> int:
+        """Number of chunks stored for a document, used to verify ingestion completeness."""
+        response = (
+            self.client.table("document_chunks")
+            .select("id", count="exact", head=True)
+            .eq("document_id", document_id)
+            .execute()
+        )
+        return response.count or 0
+
+    @retry(
+        stop=stop_after_attempt(settings.DB_MAX_RETRIES),
+        wait=wait_random_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(is_transient_error),
+        before_sleep=lambda rs: logger.warning(f"Supabase fail_stale_processing_documents retry (attempt {rs.attempt_number})"),
+    )
+    def fail_stale_processing_documents(self, older_than_minutes: int, error_message: str, box_id: Optional[str] = None) -> int:
+        """Marks documents stuck in 'processing' longer than the cutoff as failed. Returns how many."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)).isoformat()
+        query = (
+            self.client.table("documents")
+            .update({"status": "failed", "error_message": error_message})
+            .eq("status", "processing")
+            .lt("created_at", cutoff)
+        )
+        if box_id:
+            query = query.eq("box_id", box_id)
+        response = query.execute()
+        return len(response.data or [])
 
     def stored_embedding_dimension(self) -> Optional[int]:
         """Length of one stored chunk vector, or None if nothing has been embedded yet."""
@@ -315,6 +366,29 @@ class SupabaseAdapter(IVectorStore):
                 results[doc_id].append(row)
                 
         return results
+
+    # ── Auth Checks (run on every request, so they must survive dropped connections) ──
+
+    @retry(
+        stop=stop_after_attempt(settings.DB_MAX_RETRIES),
+        wait=wait_random_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(is_transient_error),
+        before_sleep=lambda rs: logger.warning(f"Supabase get_auth_user retry (attempt {rs.attempt_number})"),
+    )
+    def get_auth_user(self, token: str):
+        """Validates a user JWT with Supabase Auth and returns the user response."""
+        return self.client.auth.get_user(token)
+
+    @retry(
+        stop=stop_after_attempt(settings.DB_MAX_RETRIES),
+        wait=wait_random_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(is_transient_error),
+        before_sleep=lambda rs: logger.warning(f"Supabase get_box_for_user retry (attempt {rs.attempt_number})"),
+    )
+    def get_box_for_user(self, box_id: str, user_id: str) -> Optional[dict]:
+        """The box if this user owns it, else None."""
+        response = self.client.table("boxes").select("*").eq("id", box_id).eq("user_id", user_id).execute()
+        return response.data[0] if response.data else None
 
     # ── Box Operations (Phase 1A) ──
 

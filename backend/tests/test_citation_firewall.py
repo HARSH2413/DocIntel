@@ -32,7 +32,8 @@ def test_is_factual_sentence():
 def test_citation_firewall(mock_settings):
     mock_settings.CITATION_ENFORCEMENT_MODE = "soft"
     mock_settings.CITATION_SUPPORT_THRESHOLD = 0.3
-    mock_settings.FALLBACK_PHRASE = "I could not find the answer to this in the provided company documents."
+    from app.services.chat_service import settings as service_settings
+    mock_settings.FALLBACK_PHRASE = service_settings.FALLBACK_PHRASE
     
     # Mock dependencies
     mock_llm = MagicMock()

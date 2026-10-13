@@ -4,9 +4,18 @@ import { revalidatePath } from 'next/cache'
 import { redirect } from 'next/navigation'
 import { createClient } from '@/lib/supabase/server'
 import { MIN_PASSWORD_LENGTH } from '@/lib/authMessages'
+import { API_URL } from '@/lib/config'
+
+/** Same-site path to return to after login; anything else (absolute or protocol-relative URLs) is ignored. */
+function safeNextPath(value: FormDataEntryValue | null): string {
+  const next = typeof value === 'string' ? value : ''
+  return next.startsWith('/') && !next.startsWith('//') && !next.startsWith('/\\') ? next : '/boxes'
+}
 
 export async function login(formData: FormData) {
   const supabase = await createClient()
+  const next = safeNextPath(formData.get('next'))
+  const nextQuery = next === '/boxes' ? '' : `&next=${encodeURIComponent(next)}`
 
   const data = {
     email: formData.get('email') as string,
@@ -16,18 +25,30 @@ export async function login(formData: FormData) {
   const { error } = await supabase.auth.signInWithPassword(data)
 
   if (error) {
-    redirect('/login?error=invalid_credentials')
+    redirect(`/login?error=invalid_credentials${nextQuery}`)
   }
 
   revalidatePath('/', 'layout')
-  
-  // After login, go straight to boxes
+
   const { data: { user } } = await supabase.auth.getUser()
   if (user) {
-      redirect('/boxes')
+      redirect(next)
   } else {
-      redirect('/login?error=auth_failed')
+      redirect(`/login?error=auth_failed${nextQuery}`)
   }
+}
+
+export async function updateProfile(formData: FormData): Promise<{ ok: boolean; message: string }> {
+  const fullName = String(formData.get('fullName') ?? '').trim()
+  if (!fullName) return { ok: false, message: 'Enter a display name.' }
+  if (fullName.length > 100) return { ok: false, message: 'Display name must be 100 characters or fewer.' }
+
+  const supabase = await createClient()
+  const { error } = await supabase.auth.updateUser({ data: { full_name: fullName } })
+  if (error) return { ok: false, message: 'Could not save your name. Please try again.' }
+
+  revalidatePath('/', 'layout')
+  return { ok: true, message: 'Display name saved.' }
 }
 
 export async function signup(formData: FormData) {
@@ -82,26 +103,33 @@ export async function createBox(formData: FormData) {
       redirect('/login')
   }
 
-  const boxName = formData.get('boxName') as string
-
-  // Use the backend API to create the box
-  const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
-  const res = await fetch(`${API_URL}/api/v1/boxes/`, {
-      method: 'POST',
-      headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${session.access_token}`
-      },
-      body: JSON.stringify({ name: boxName.trim() })
-  });
-
-  if (!res.ok) {
-      const code = res.status === 409 ? 'box_exists' : res.status === 403 ? 'box_limit' : 'box_failed';
-      redirect(`/onboarding?message=${code}`)
+  const boxName = String(formData.get('boxName') ?? '').trim()
+  if (!boxName) {
+      redirect('/onboarding?message=box_failed')
   }
 
-  const json = await res.json();
-  const box = json.data;
+  // redirect() throws, so the request and its outcome are resolved before redirecting.
+  let target = '/onboarding?message=box_failed'
+  try {
+      const res = await fetch(`${API_URL}/api/v1/boxes/`, {
+          method: 'POST',
+          headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${session.access_token}`
+          },
+          body: JSON.stringify({ name: boxName })
+      });
+      if (res.ok) {
+          const json = await res.json();
+          target = `/boxes/${json.data.id}`
+      } else if (res.status === 409) {
+          target = '/onboarding?message=box_exists'
+      } else if (res.status === 403) {
+          target = '/onboarding?message=box_limit'
+      }
+  } catch {
+      // Network failure: fall through to the generic message.
+  }
 
-  redirect(`/boxes/${box.id}`)
+  redirect(target)
 }

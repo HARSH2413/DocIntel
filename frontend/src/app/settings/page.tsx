@@ -3,12 +3,14 @@ import { createClient } from '@/lib/supabase/server';
 import ShellLayout from '@/components/layout/ShellLayout';
 import SettingsView from './SettingsView';
 
+export const metadata = { title: 'Settings' };
+
 export default async function SettingsPage() {
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
 
   if (!user) {
-    redirect('/login');
+    redirect('/login?next=/settings');
   }
 
   return (

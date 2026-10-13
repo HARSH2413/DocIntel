@@ -81,6 +81,7 @@ def get_ingestion_service() -> IngestionService:
         chunk_size=settings.CHUNK_SIZE,
         chunk_overlap=settings.CHUNK_OVERLAP,
         batch_size=settings.INGESTION_BATCH_SIZE,
+        stale_processing_minutes=settings.STALE_PROCESSING_MINUTES,
     )
 
 def get_box_service() -> BoxService:

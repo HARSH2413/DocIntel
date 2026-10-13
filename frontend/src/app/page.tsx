@@ -1,7 +1,13 @@
 import Link from 'next/link'
-import { ArrowRight, Database, Search, Shield, Zap, UploadCloud, MessageSquare, FileText, CheckCircle2, Sparkles } from 'lucide-react'
+import { ArrowRight, Search, Zap, UploadCloud, MessageSquare, FileText, CheckCircle2 } from 'lucide-react'
+import { Logo, LogoMark } from '@/components/brand/Logo'
+import { createClient } from '@/lib/supabase/server'
 
-export default function LandingPage() {
+export default async function LandingPage() {
+  // Signed-in visitors get a way straight back into the app instead of sign-up prompts.
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+
   return (
     <div className="min-h-screen bg-[#f8fafc] text-slate-900 flex flex-col font-sans selection:bg-indigo-100 selection:text-indigo-900 relative overflow-hidden">
 
@@ -12,28 +18,33 @@ export default function LandingPage() {
       </div>
 
       {/* Navigation */}
-      <nav className="relative z-10 flex items-center justify-between px-6 py-6 max-w-7xl w-full mx-auto animate-fade-in-up" style={{ animationDelay: '0.1s', opacity: 0 }}>
-        <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-lg bg-indigo-50 border border-indigo-100 flex items-center justify-center font-bold text-indigo-600 shadow-sm" aria-hidden="true">
-            <Sparkles className="w-4 h-4 text-indigo-600" />
+      <header className="relative z-10 animate-fade-in-up" style={{ animationDelay: '0.1s', opacity: 0 }}>
+        <nav aria-label="Main" className="flex items-center justify-between px-4 sm:px-6 py-5 sm:py-6 max-w-7xl w-full mx-auto">
+          <Link href="/" aria-label="DocIntel home" className="rounded-lg">
+            <Logo size="lg" />
+          </Link>
+          <div className="flex items-center gap-2 sm:gap-4 text-sm font-medium">
+            {user ? (
+              <Link href="/boxes" className="bg-indigo-600 text-white px-5 py-2.5 rounded-full hover:bg-indigo-700 transition-colors shadow-sm">
+                Open DocIntel
+              </Link>
+            ) : (
+              <>
+                <Link href="/login" className="text-slate-600 hover:text-slate-900 transition-colors rounded-md px-3 py-2">
+                  Log in
+                </Link>
+                <Link href="/signup" className="bg-indigo-600 text-white px-5 py-2.5 rounded-full hover:bg-indigo-700 transition-colors shadow-sm">
+                  Sign up
+                </Link>
+              </>
+            )}
           </div>
-          <span className="text-xl font-bold tracking-tight font-headline">DocIntel</span>
-        </div>
-        <div className="flex items-center gap-6 text-sm font-medium">
-          <Link href="/login" className="text-slate-500 hover:text-slate-900 transition-colors hidden sm:block focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 focus-visible:ring-offset-white outline-none rounded-md px-2 py-1">
-            Log In
-          </Link>
-          <Link
-            href="/signup"
-            className="bg-indigo-600 text-white px-5 py-2.5 rounded-full hover:bg-indigo-700 transition-colors shadow-sm focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 focus-visible:ring-offset-white outline-none"
-          >
-            Sign Up
-          </Link>
-        </div>
-      </nav>
+        </nav>
+      </header>
 
+      <main id="main-content" className="relative z-10 flex-1">
       {/* Hero Section */}
-      <main className="relative z-10 flex-1 flex flex-col items-center px-4 pt-16 pb-24 max-w-6xl mx-auto w-full">
+      <section aria-labelledby="hero-title" className="flex flex-col items-center px-4 pt-12 sm:pt-16 pb-24 max-w-6xl mx-auto w-full">
 
         {/* Text Content */}
         <div className="text-center max-w-3xl mx-auto">
@@ -46,7 +57,8 @@ export default function LandingPage() {
           </div>
 
           <h1
-            className="text-5xl md:text-7xl font-bold tracking-tight mb-6 text-slate-900 font-headline leading-tight animate-fade-in-up"
+            id="hero-title"
+            className="text-4xl sm:text-5xl md:text-7xl font-bold tracking-tight mb-6 text-slate-900 font-headline leading-tight animate-fade-in-up"
             style={{ animationDelay: '0.2s', opacity: 0 }}
           >
             Understand any document <br className="hidden md:block" />
@@ -57,25 +69,36 @@ export default function LandingPage() {
             className="text-lg md:text-xl text-slate-500 mb-10 leading-relaxed max-w-2xl mx-auto animate-fade-in-up"
             style={{ animationDelay: '0.3s', opacity: 0 }}
           >
-            DocIntel reads your PDFs, connects the dots, and answers your questions instantly with precise citations. Built for students, researchers, and professionals.
+            Upload PDFs, Word files, spreadsheets and notes, then ask questions in plain language. DocIntel answers with citations to the exact passages it used.
           </p>
 
           <div
             className="flex flex-col sm:flex-row items-center gap-4 justify-center animate-fade-in-up"
             style={{ animationDelay: '0.4s', opacity: 0 }}
           >
-            <Link
-              href="/signup"
-              className="flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-8 py-4 rounded-full font-medium transition-all duration-300 hover:scale-105 active:scale-95 w-full sm:w-auto shadow-md shadow-indigo-200 focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 focus-visible:ring-offset-white outline-none"
-            >
-              Get Started for Free <ArrowRight className="w-4 h-4" aria-hidden="true" />
-            </Link>
-            <Link
-              href="/login"
-              className="flex items-center justify-center gap-2 bg-white hover:bg-slate-50 hover:-translate-y-0.5 text-slate-700 px-8 py-4 rounded-full font-medium transition-all duration-300 border border-slate-200 hover:border-slate-300 w-full sm:w-auto focus-visible:ring-2 focus-visible:ring-slate-500 focus-visible:ring-offset-2 focus-visible:ring-offset-white outline-none shadow-sm"
-            >
-              Log In
-            </Link>
+            {user ? (
+              <Link
+                href="/boxes"
+                className="flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-8 py-4 rounded-full font-medium transition-all duration-300 hover:scale-105 active:scale-95 w-full sm:w-auto shadow-md shadow-indigo-200"
+              >
+                Go to your boxes <ArrowRight className="w-4 h-4" aria-hidden="true" />
+              </Link>
+            ) : (
+              <>
+                <Link
+                  href="/signup"
+                  className="flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-8 py-4 rounded-full font-medium transition-all duration-300 hover:scale-105 active:scale-95 w-full sm:w-auto shadow-md shadow-indigo-200"
+                >
+                  Get started for free <ArrowRight className="w-4 h-4" aria-hidden="true" />
+                </Link>
+                <Link
+                  href="/login"
+                  className="flex items-center justify-center gap-2 bg-white hover:bg-slate-50 hover:-translate-y-0.5 text-slate-700 px-8 py-4 rounded-full font-medium transition-all duration-300 border border-slate-200 hover:border-slate-300 w-full sm:w-auto shadow-sm"
+                >
+                  Log in
+                </Link>
+              </>
+            )}
           </div>
         </div>
 
@@ -118,9 +141,7 @@ export default function LandingPage() {
                   </div>
 
                   <div className="flex gap-4 items-start max-w-[90%]">
-                    <div className="w-8 h-8 shrink-0 rounded-lg bg-indigo-50 border border-indigo-100 flex items-center justify-center">
-                      <svg className="w-4 h-4 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
-                    </div>
+                    <LogoMark className="w-8 h-8" />
                     <div className="bg-white border border-indigo-100 text-slate-800 p-4 rounded-2xl rounded-tl-sm text-sm leading-relaxed shadow-sm">
                       Based on the <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 text-slate-600 text-xs font-mono shadow-xs">Q3_Financial_Report.pdf</span>, the primary revenue drivers were:
                       <ul className="list-disc pl-5 mt-2 space-y-1 text-slate-600">
@@ -143,10 +164,10 @@ export default function LandingPage() {
             </div>
           </div>
         </div>
-      </main>
+      </section>
 
       {/* How It Works Section */}
-      <section className="relative z-10 bg-slate-50 border-t border-slate-200 py-24">
+      <section className="relative z-10 bg-slate-50 border-t border-slate-200 py-20 md:py-24">
         <div className="max-w-7xl mx-auto px-6">
           <div className="text-center mb-16 animate-fade-in-up" style={{ animationDelay: '0.2s', opacity: 0 }}>
             <h2 className="text-3xl font-bold text-slate-900 font-headline mb-4">How it works</h2>
@@ -161,29 +182,29 @@ export default function LandingPage() {
               number="1"
               delay="0.3s"
               icon={<UploadCloud className="w-6 h-6 text-indigo-600" />}
-              title="Upload Your Documents"
-              description="Upload PDFs and other supported documents to your Box."
+              title="Upload your documents"
+              description="Add PDF, Word, text, CSV or Excel files — up to 25 MB each — to a private box."
             />
             <StepCard
               number="2"
               delay="0.4s"
               icon={<Zap className="w-6 h-6 text-purple-600" />}
-              title="Let DocIntel Process Them"
-              description="DocIntel extracts and indexes document content so it's ready for searching and asking questions."
+              title="DocIntel reads them"
+              description="Text is extracted and indexed so it can be searched by meaning, usually within a minute or two."
             />
             <StepCard
               number="3"
               delay="0.5s"
               icon={<MessageSquare className="w-6 h-6 text-emerald-600" />}
-              title="Ask Questions"
-              description="Ask questions about your documents and receive answers based on the available information."
+              title="Ask questions"
+              description="Get answers drawn only from your documents, with every claim linked to its source passage."
             />
           </div>
         </div>
       </section>
 
       {/* Features Grid */}
-      <section className="relative z-10 bg-white border-t border-slate-200 py-24">
+      <section className="relative z-10 bg-white border-t border-slate-200 py-20 md:py-24">
         <div className="max-w-7xl mx-auto px-6">
           <div className="text-center mb-16 animate-fade-in-up" style={{ animationDelay: '0.2s', opacity: 0 }}>
             <h2 className="text-3xl font-bold text-slate-900 font-headline mb-4">Everything you need to work smarter</h2>
@@ -194,44 +215,46 @@ export default function LandingPage() {
             <FeatureCard
               delay="0.3s"
               icon={<UploadCloud className="w-6 h-6 text-indigo-600" />}
-              title="Secure Uploads"
-              description="Simply drag and drop your PDFs. We securely process and index them in seconds."
+              title="Private by default"
+              description="Each box belongs to your account alone. Original files are deleted once they've been processed."
             />
             <FeatureCard
               delay="0.4s"
               icon={<Search className="w-6 h-6 text-purple-600" />}
-              title="Semantic Search"
-              description="Find relevant information instantly. Our AI understands context, not just keywords."
+              title="Search by meaning"
+              description="Finds the right passages even when your question uses different words than the document."
             />
             <FeatureCard
               delay="0.5s"
               icon={<MessageSquare className="w-6 h-6 text-emerald-600" />}
-              title="Conversational AI"
-              description="Ask natural questions and get synthesized answers with direct source citations."
+              title="Answers you can check"
+              description="Every answer cites its sources. Click a citation to read the exact passage it came from."
             />
           </div>
         </div>
       </section>
+      </main>
 
       {/* Footer */}
       <footer className="relative z-10 border-t border-slate-200 bg-slate-50 py-12">
         <div className="max-w-7xl mx-auto px-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-8 text-sm text-slate-500">
           <div className="flex flex-col gap-3 max-w-md">
-            <div className="flex items-center gap-2">
-              <div className="w-6 h-6 rounded bg-indigo-50 border border-indigo-100 flex items-center justify-center font-bold text-indigo-600" aria-hidden="true">
-                <Sparkles className="w-3 h-3 text-indigo-600" />
-              </div>
-              <span className="font-semibold text-slate-700 font-headline tracking-tight">DocIntel</span>
-            </div>
+            <Logo size="sm" />
             <p className="leading-relaxed text-slate-500">
-              Your files are strictly isolated to your personal Box. Original files are deleted immediately after secure vector processing.
+              Your documents stay in your own private boxes. Original files are deleted once they&apos;ve been processed.
             </p>
             <span>© {new Date().getFullYear()} DocIntel. All rights reserved.</span>
           </div>
-          <div className="flex gap-6">
-            <Link href="/login" className="font-medium hover:text-slate-900 transition-colors focus-visible:ring-2 focus-visible:ring-slate-500 outline-none rounded px-1">Log In</Link>
-            <Link href="/signup" className="font-semibold text-indigo-600 hover:text-indigo-700 transition-colors focus-visible:ring-2 focus-visible:ring-indigo-500 outline-none rounded px-1">Sign Up</Link>
-          </div>
+          <nav aria-label="Footer" className="flex gap-6">
+            {user ? (
+              <Link href="/boxes" className="font-semibold text-indigo-600 hover:text-indigo-700 transition-colors rounded px-1">Open DocIntel</Link>
+            ) : (
+              <>
+                <Link href="/login" className="font-medium hover:text-slate-900 transition-colors rounded px-1">Log in</Link>
+                <Link href="/signup" className="font-semibold text-indigo-600 hover:text-indigo-700 transition-colors rounded px-1">Sign up</Link>
+              </>
+            )}
+          </nav>
         </div>
       </footer>
     </div>
