@@ -32,6 +32,7 @@ Every answer is grounded in retrieved passages and carries clickable citations b
    - [6.4 Question Answering (RAG Pipeline)](#64-question-answering-workflow-rag-pipeline)
    - [6.5 Hybrid Retrieval in Detail](#65-hybrid-retrieval-in-detail)
    - [6.6 Citation Firewall](#66-citation-firewall)
+   - [6.7 Design Strategies](#67-design-strategies)
 7. [Data Model](#7-data-model)
 8. [API Reference](#8-api-reference)
 9. [Configuration Reference](#9-configuration-reference)
@@ -642,6 +643,125 @@ Implemented in `ChatService._validate_and_build_citations` and [`utils/citation_
    - `soft` (default): unsupported claims are reported in `validation_metadata` but kept.
    - `strict`: unsupported claims and their citations are removed from the answer.
 6. **Build citation objects** only for evidence IDs that survive in the final text.
+
+### 6.7 Design Strategies
+
+Sections 6.3–6.6 show **what** each pipeline does. This section explains **why** it is built that way, stage by stage. Where a mechanism is already described above, it is linked rather than repeated.
+
+```mermaid
+flowchart LR
+    A[Parse<br/>keep structure] --> B[Chunk<br/>parent / child]
+    B --> C[Embed<br/>short context header]
+    C --> D[Retrieve<br/>dense + BM25 → RRF → rerank]
+    D --> E[Select evidence<br/>gate · rescue · siblings]
+    E --> F[Generate<br/>grounded prompt · temp 0]
+    F --> G[Verify<br/>citation firewall]
+```
+
+#### 6.7.1 Document parsing strategy
+
+**Principle:** extract *all* the text, in reading order, and keep the document's structure as plain-text markers (`##` headings, `cell | cell` rows, `--- Sheet: name ---`) that chunking can use later. There is no OCR, LLM or vision model, so ingestion stays fast and predictable on CPU-only machines.
+
+| Decision | Why |
+|---|---|
+| **Column-aware PDF reading order** ([`pdf_parser.py`](backend/app/utils/pdf_parser.py)): a two-column layout is detected when a vertical gutter in the middle 45–55 % of the page is crossed by no more than 10 % of text blocks; the left column is then read before the right, and full-width blocks (titles, footers) keep their position | Reading two columns line by line mixes unrelated sentences. Wrong reading order makes chunks meaningless. |
+| **TOC first, heuristics second** for PDF section titles (short UPPERCASE or `1. Topic` lines) | The table of contents is the author's own structure. The heuristics are only a fallback. |
+| **DOCX parsed from the raw XML**, not from python-docx's paragraph text | Tracked insertions, text boxes and content controls would otherwise be dropped silently. |
+| **Reject instead of half-indexing**: a DOCX must yield ≥ 98 % of its visible characters, and an XLSX must have saved values for its formula cells | A partly indexed document gives confident but incomplete answers, which is worse than a clear upload error. |
+| **Spreadsheet rows written as `Header: value \| Header: value`** | Each row carries its own column names, so a chunk stays understandable without the header row. |
+| **Bidirectional control characters become spaces**; zero-width characters are deleted | Some exporters (for example Google Docs → PDF) put these marks between words instead of spaces. Deleting them glued whole pages into a single "word". |
+| **Strict text decoding** (UTF-16 BOM → UTF-8 → Windows-1252, otherwise reject) | Replacing undecodable bytes would index unreadable text that can never be found. |
+
+#### 6.7.2 Chunking strategy
+
+**Principle:** chunks small enough for precise matching, never cut across a section or a table row, and always traceable to a page and section.
+
+```mermaid
+flowchart LR
+    T[Structured text] --> P{Parent sections}
+    P -- "DOCX / TXT" --> H[Heading sections]
+    P -- XLSX --> SH[One per sheet]
+    P -- CSV --> DS[One dataset]
+    P -- PDF --> PG[Page batch + TOC section]
+    H --> SP[Recursive split<br/>1400 / 200]
+    PG --> SP
+    SH --> RW[Whole-row grouping]
+    DS --> RW
+    SP --> CH[Child chunks + metadata]
+    RW --> CH
+```
+
+1. **Hierarchical parent/child chunking** ([`hierarchical_chunking.py`](backend/app/services/hierarchical_chunking.py)). The text is first split into logical **parents** (heading sections, sheets, datasets). Only the **children** are embedded and stored; the parent lives in each child's metadata (`parent_id`, `parent_title`, `section_path`). *Why:* this gives section-aware context at no extra cost. There are no parent vectors, so the vector count and RAM use stay the same as flat chunking, while retrieval can still expand within a section ([§6.7.5](#675-evidence-selection-strategy)).
+2. **1,400 characters with 200 overlap** (`CHUNK_SIZE` / `CHUNK_OVERLAP`). That is about 300–350 English tokens: enough for a full clause or paragraph, small enough to stay on one topic. The overlap (about 14 %) is kept low on purpose, to avoid paying for near-duplicate embeddings on CPU.
+3. **Structure-first split order.** The splitter tries `\n## ` → `\n### ` → `\n#### ` → paragraph → line → sentence → word, and only moves to a finer boundary when a piece is still too large. A chunk therefore usually starts at a heading or paragraph, not mid-sentence.
+4. **Tables are grouped by whole rows.** Spreadsheet and table blocks never go through the character splitter. Complete rows are packed up to the chunk size, so a row and its values are never separated.
+5. **Tiny PDF fragments are merged using the original source span.** Pieces under 200 characters are joined to the previous chunk by taking the source text from the first chunk's start to the small chunk's end, not by concatenating two overlapping strings. The stored text therefore always exists verbatim in the document, which keeps page mapping and citations exact.
+6. **Page mapping with a safe fallback.** Each chunk's character offsets are matched to the pages they overlap (`page_start` / `page_end`). If the offsets cannot be confirmed, the batch's page range is used instead of a guess.
+
+The stored metadata fields are listed in [§6.3](#63-document-upload--ingestion-workflow).
+
+#### 6.7.3 Embedding strategy
+
+| Decision | Why |
+|---|---|
+| **Local `BAAI/bge-base-en-v1.5`** (768 dimensions, ONNX via FastEmbed) | No per-call cost or rate limit, and document text never leaves the server to be embedded. The base model is a good balance of quality and CPU speed. |
+| **Only `[Document: <file> \| Section: <section>]` is prepended** to the chunk before embedding | File and section names add useful meaning. Page numbers, file type and chunk counters are noise to similarity, so they stay in metadata (`context_header`), which is given to the reranker instead. |
+| **Asymmetric query instruction**: queries, not passages, get `"Represent this sentence for searching relevant passages: "` | This is how BGE models were trained for short-query → passage retrieval. |
+| **Passages are embedded in batches** (`INGESTION_BATCH_SIZE`); **all query phrasings in one call** | Batching limits peak RAM during ingestion; one call keeps the rescue pass fast. |
+| **Boot-time dimension check** | A model whose vectors don't match the database would make every vector search fail and quietly fall back to keywords. It is reported loudly instead. |
+
+#### 6.7.4 Retrieval strategy
+
+**Principle:** *recall first, precision second.* Two cheap retrievers that fail in different ways produce a wide candidate pool; one expensive cross-encoder then picks the best few. The mechanics are in [§6.5](#65-hybrid-retrieval-in-detail). The reasoning:
+
+- **Why two retrievers.** Dense vectors match meaning and paraphrase ("notice period" ≈ "resignation timeline") but blur exact tokens. BM25 matches exact terms, codes, names and numbers ("Section 54", "GST") but misses synonyms. Together they cover each other's blind spots.
+- **Why exact vector search inside a box.** With an HNSW index, Postgres would take only the nearest ~40 chunks (`ef_search`) *across all users' boxes* and filter by box afterwards, so a small box could get no hits at all. A box holds at most `MAX_DOCUMENTS_PER_BOX` documents, so ranking all its chunks exactly is cheap, and the results are exact instead of approximate.
+- **How BM25 is tuned.** One in-memory index per box (k1 = 1.2, b = 0.75). The indexed text is section title + content. Stopwords are removed and words are Snowball-stemmed (*policies* → *policy*). Acronyms are expanded from `LEXICAL_SYNONYMS` (GST, PF/EPF, PTO, HR, NDA, KPI, ROI). The index is not saved to disk: a disk copy would duplicate every chunk's text in plain files and could go stale across restarts.
+- **Why Reciprocal Rank Fusion (k = 60).** Cosine similarity and BM25 scores are on different, incomparable scales. RRF uses only **ranks** (`1 / (60 + rank)` per list), so no score normalisation is needed, and a chunk found by both retrievers naturally rises to the top. Ties are broken by dense score and then by document/chunk order, so the same question always gives the same ranking.
+- **Why a cross-encoder last.** It reads the query and the chunk (with its context header) together, which is far more accurate than comparing two separate vectors. It is too slow to run over a whole box, so it only reranks the fused top `RETRIEVAL_TOP_K` (template: 50) down to `RERANKER_TOP_K` (template: 10). Its scores are passed through a sigmoid to a 0–1 range, so one set of relevance thresholds works everywhere.
+- **Why degraded results are never cached.** If one retriever or the reranker fails, the answer still comes back, but caching that weaker result would keep serving it for an hour after the problem was fixed.
+
+#### 6.7.5 Evidence selection strategy
+
+**Principle:** it is better to say *"not found"* than to answer from weak evidence.
+
+1. **One relevance scale for every source.** The reranker score is authoritative. Without it, cosine similarity is rescaled with `EMBEDDING_SCORE_FLOOR` (0.5): BGE gives even unrelated text a cosine of about 0.4–0.5, so using raw cosine would let almost everything through. Keyword-only hits score 0, so they can never pass a gate without semantic support.
+2. **Adaptive threshold.** Chunks must score ≥ `MIN_RELEVANCE_SCORE`. If fewer than 2 pass, the floor drops to `MIN_RELEVANCE_SCORE_LOW`. This keeps strict filtering for broad questions without starving narrow ones.
+3. **Answer gate, then a rescue pass, then refusal.** If the best chunk is below `ANSWER_MIN_RELEVANCE_SCORE`, the question is rephrased and retried once with all its variants fused together ([§6.5](#65-hybrid-retrieval-in-detail)). If it is still too weak, the user gets the fixed fallback phrase and the 3 closest passages, so they can see what *was* found. The phrase says *"not found in the retrieved sections"*, never *"not in your documents"*, because retrieval only ever reads the top-ranked sections.
+4. **Sibling-only neighbour expansion** (when `ENABLE_NEIGHBOR_CONTEXT=true`). The top `MAX_EXPAND_DOCS` hits fetch the chunk just before and just after them (±1 `chunk_index`, in one batched query). A neighbour is used **only if it has the same `parent_id`**, so context never leaks into an unrelated section. Each neighbour is capped at `MAX_NEIGHBOR_CHARS`, and consecutive chunks are merged into one block with a combined page range. This repairs answers that were split across a chunk boundary without diluting the context.
+5. **Labelled evidence blocks.** Each block is numbered `[E1]…[En]` and labelled with source file, pages, section and relevance, so the model can cite precisely and the firewall can check each citation against exactly one block.
+
+Confidence labels are listed in [§6.4](#64-question-answering-workflow-rag-pipeline).
+
+#### 6.7.6 Query understanding strategy
+
+**Principle:** spend LLM calls only where rules cannot do the job.
+
+- **Follow-up detection by rules** ([`query_router.py`](backend/app/services/query_router.py)). A question is treated as a follow-up only if there is chat history **and** it is very short (≤ 3 words), starts like a continuation (*"what about"*, *"how about"*, *"and…"*, *"also…"*, *"why…"*), or uses a pronoun (*it, they, them, these, those…*). *This* and *that* only count when the user is not referring to "this document". Standalone questions never pay for a rewrite.
+- **One rewrite call when needed** ([`query_expansion.py`](backend/app/services/query_expansion.py)). The LLM returns JSON with a standalone version of the question (pronouns resolved from the last 6 messages) and up to 3 paraphrases. It must keep dates, acronyms and names exactly, and must drop earlier topics when the user starts a new one, so the search doesn't drift. If the call fails, the original question is used.
+- **Answer planning by rules** ([`answer_planner.py`](backend/app/services/answer_planner.py)). The question type picks the answer format (table in [§6.4](#64-question-answering-workflow-rag-pipeline)). Multi-part questions are split into at most 4 parts, because more parts multiply retrieval time for little gain. A split is accepted only if every piece reads as a question, so *"In case of resignation, what is the notice period"* stays whole.
+- **Per-part retrieval with fair merging.** The whole question and each part are searched separately. A vague part (*"how is it approved"*) is joined to the first part to give it context. Results are merged **round-robin**, about 2 chunks per list and at most 10 in total, so one strong part cannot take every evidence slot.
+
+#### 6.7.7 Answer generation strategy
+
+- **Grounded system prompt.** Answer only from CONTEXT. Cite every factual sentence, bullet and table row with its `[E#]`. Never invent IDs, pages, quotations or facts. Keep exceptions, conditions, names, dates and who-said-what exactly. Never turn a qualified statement into an absolute one.
+- **Shape matches the question.** The format guide for the question type and, for multi-part questions, a numbered checklist of required parts are added to the prompt.
+- **Gaps are stated, not filled.** For any part the evidence doesn't cover, the model writes *"The retrieved sections do not cover …"*. The full fallback phrase is used only when nothing in the context is relevant.
+- **Deterministic and bounded.** Temperature 0 and the last 8 messages of history. At most **one** corrective retry per question: either for zero valid citations, or for a skipped part or missing structure (a part counts as covered when 60 % of its key words appear in the answer). A rewrite is kept only if it still carries valid citations.
+
+#### 6.7.8 Anti-hallucination: defence in depth
+
+No single check is trusted alone. Each layer catches what the previous one misses:
+
+| Layer | What it stops | Where |
+|---|---|---|
+| Complete, verified ingestion | Answers based on half-indexed documents | [§6.3](#63-document-upload--ingestion-workflow), [§6.7.1](#671-document-parsing-strategy) |
+| Relevance gates + rescue pass | Answers built on off-topic chunks | [§6.7.5](#675-evidence-selection-strategy) |
+| Fixed fallback phrase + closest matches | Confident guesses when nothing relevant was found | [§6.7.5](#675-evidence-selection-strategy) |
+| Grounded prompt at temperature 0 | Free-form invention and run-to-run variation | [§6.7.7](#677-answer-generation-strategy) |
+| Citation firewall (IDs, numbers, cross-encoder support) | Invented citations, wrong numbers, unsupported claims | [§6.6](#66-citation-firewall) |
+| One corrective retry | Uncited or incomplete answers | [§6.7.7](#677-answer-generation-strategy) |
+| Absence-claim rewording | "The document doesn't say X" when only part of it was read | [§6.6](#66-citation-firewall) |
 
 ---
 
