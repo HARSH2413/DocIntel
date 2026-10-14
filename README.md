@@ -39,11 +39,10 @@ Every answer is grounded in retrieved passages and carries clickable citations b
 10. [Getting Started](#10-getting-started)
 11. [Testing](#11-testing)
 12. [Utility Scripts](#12-utility-scripts)
-13. [Deployment Notes](#13-deployment-notes)
-14. [Security Model](#14-security-model)
-15. [Resilience & Performance](#15-resilience--performance)
-16. [Known Limitations & Roadmap](#16-known-limitations--roadmap)
-17. [Troubleshooting](#17-troubleshooting)
+13. [Security Model](#13-security-model)
+14. [Resilience & Performance](#14-resilience--performance)
+15. [Known Limitations](#15-known-limitations)
+16. [Troubleshooting](#16-troubleshooting)
 
 ---
 
@@ -83,7 +82,7 @@ flowchart LR
 | **Anti-hallucination** | Relevance gates, a rescue retrieval pass, a fixed fallback phrase, evidence-ID validation, number verification, cross-encoder sentence support scoring, one self-correction retry. |
 | **Citations UI** | Inline `[E1]` markers rendered as clickable chips that open the exact source passage with filename, page range and section. |
 | **Conversations** | Persistent chat sessions per box: create, rename, delete, reload history. |
-| **Security** | Supabase Auth (JWT), per-box ownership checks, Postgres Row-Level Security, Prompt Guard injection screening, magic-byte file validation, zip-bomb guard, strict CSP and security headers, per-user rate limiting and quotas. |
+| **Security** | Supabase Auth (JWT), per-box ownership checks, Postgres Row-Level Security, grounded system prompt enforcement, magic-byte file validation, zip-bomb guard, strict CSP and security headers, per-user rate limiting and quotas. |
 | **Operations** | Health endpoint with retrieval-degradation status, boot-time embedding-dimension check, stale-ingestion sweeper, structured timing and audit logs. |
 | **Cost** | Embeddings and reranking run locally on CPU (ONNX via FastEmbed). Only generation calls the Groq API, so the whole stack can run on free tiers. |
 
@@ -98,7 +97,7 @@ flowchart LR
 | Web framework | **FastAPI** 0.143 on **Uvicorn**, Starlette threadpools for blocking I/O |
 | Configuration | **pydantic-settings** (type-safe, `.env`-driven) |
 | Database & Auth | **Supabase** (PostgreSQL + **pgvector** + Supabase Auth) via `supabase-py` |
-| LLM | **Groq** API: model configurable via `LLM_MODEL_NAME` in `.env`; `meta-llama/llama-prompt-guard-2-86m` for injection screening |
+| LLM | **Groq** API: model configurable via `LLM_MODEL_NAME` in `.env` (e.g. `llama-3.1-8b-instant`) |
 | Embeddings | **FastEmbed** (ONNX, local CPU): `BAAI/bge-base-en-v1.5`, 768 dimensions |
 | Reranker | **FastEmbed TextCrossEncoder**: `Xenova/ms-marco-MiniLM-L-12-v2` |
 | Keyword search | **bm25s** with **py_rust_stemmers** (Snowball English stemmer) |
@@ -116,15 +115,6 @@ flowchart LR
 | Auth | **@supabase/ssr** + **@supabase/supabase-js** (cookie-based sessions) |
 | Markdown | **react-markdown** + **remark-gfm** (tables, lists, citation links) |
 | Language | **TypeScript 5** |
-
-### Infrastructure (free-tier friendly)
-
-| Layer | Suggested host |
-|---|---|
-| Frontend | Vercel |
-| Backend | Railway (or any container/VM host with about 2 GB RAM for the local models) |
-| Database / Auth | Supabase |
-| LLM | Groq |
 
 ---
 
@@ -166,7 +156,7 @@ flowchart TB
         RPC["RPC: match_documents_dense_box"]
     end
 
-    GROQ["Groq API<br/>LLM (configurable) · Prompt Guard 2"]
+    GROQ["Groq API<br/>LLM (configurable)"]
 
     UI <-->|cookies| PX
     UI --> SA
@@ -300,7 +290,7 @@ sequenceDiagram
 │   │   │   ├── boxes.py          ← Box CRUD
 │   │   │   ├── upload.py         ← streaming upload, validation, backpressure, background ingestion
 │   │   │   ├── documents.py      ← list / delete documents, stale detection
-│   │   │   └── chat.py           ← sessions CRUD, Prompt Guard, Q&A endpoint
+│   │   │   └── chat.py           ← sessions CRUD, Q&A endpoint
 │   │   ├── core/
 │   │   │   ├── config.py         ← all settings (pydantic-settings)
 │   │   │   ├── dependencies.py   ← DI container (singleton adapters, service factories)
@@ -324,10 +314,7 @@ sequenceDiagram
 │   │   └── utils/
 │   │       ├── pdf_parser.py           ← column-aware reading order for PDF blocks
 │   │       └── citation_validator.py   ← sentence/claim parsing, number checks, answer cleanup
-│   ├── schema_phase1b.sql        ← base schema: tables, indexes, RLS policies
-│   ├── schema_phase1c_domain.sql ← adds boxes.domain
-│   ├── schema_phase1e_dense.sql  ← dense search RPC (superseded by migrations below)
-│   ├── migrations/               ← ordered, idempotent migrations (run after the schema files)
+│   ├── schema.sql                ← consolidated database schema: tables, indexes, RLS, RPC
 │   ├── scripts/                  ← benchmark, re-ingest, dry-run and debugging tools
 │   └── tests/                    ← 27 pytest modules
 │
@@ -513,9 +500,7 @@ flowchart TD
 ```mermaid
 flowchart TD
     Q([Question + box_id + session_id]) --> G0{Rate limit · box ownership}
-    G0 --> G1{Prompt Guard 2<br/>injection score > 0.5?}
-    G1 -- yes --> BLK[400 blocked]
-    G1 -- "no (fails open on error)" --> G2{Session belongs to box?}
+    G0 --> G2{Session belongs to box?}
     G2 -- no --> NF[404]
     G2 -- yes --> S1[Save user message]
     S1 --> S2[Load history · keep last 8 messages]
@@ -832,19 +817,18 @@ erDiagram
 - **Indexes:** a unique `(user_id, lower(btrim(name)))` on boxes; a unique `(box_id, file_hash)` on documents; `(document_id, chunk_index)` and an HNSW cosine index on chunks; `(box_id, status)` on documents; `session_id` on chat messages.
 - **RPC:** `match_documents_dense_box(query_embedding vector, match_box_id uuid, match_count int)` can be executed **only by `service_role`**.
 
-### Schema files and migrations (apply in this order)
+### Database Schema Setup
 
-| # | File | What it does |
-|---|---|---|
-| 1 | `backend/schema_phase1b.sql` | Extensions (`uuid-ossp`, `vector`), all tables, indexes, RLS policies, original hybrid RPC |
-| 2 | `backend/schema_phase1c_domain.sql` | Adds `boxes.domain` with a CHECK constraint |
-| 3 | `backend/schema_phase1e_dense.sql` | Dense-search RPC (optional; replaced by #4 and #7) |
-| 4 | `backend/migrations/20261010_switch_to_bge_base_768.sql` | **Truncates chunks**, switches the embedding column to `vector(768)`, rebuilds HNSW and RPCs |
-| 5 | `backend/migrations/20261011_drop_unused_objects.sql` | Drops the unused hybrid RPC, tsvector pipeline, `summary` column and chunk-swap helper |
-| 6 | `backend/migrations/20261012_security_hardening.sql` | Locks the RPC to `service_role`; blocks self-inserted `system` chat rows |
-| 7 | `backend/migrations/20261013_exact_box_dense_search.sql` | Exact per-box dense search, dimension-agnostic signature, `(box_id, status)` index |
+The database schema is defined in a single consolidated file: [`backend/schema.sql`](backend/schema.sql).
 
-> **Warning:** migration #4 runs `TRUNCATE document_chunks`. On an existing database, re-upload or re-ingest your documents after running it.
+It provisions:
+- Extensions: `uuid-ossp` and `vector` (pgvector)
+- Core tables: `boxes`, `documents`, `document_chunks`, `chat_sessions`, `chat_messages`
+- Indexes: case-insensitive box name uniqueness, file hash deduplication per box, chunk ordering, and HNSW cosine index on 768-dimensional embeddings
+- Row-Level Security (RLS) policies enforcing per-box user isolation
+- The `match_documents_dense_box` vector search RPC restricted to `service_role`
+
+Run `backend/schema.sql` once in your Supabase **SQL Editor**.
 
 ---
 
@@ -892,7 +876,7 @@ Interactive docs (`/docs`, `/redoc`, `/openapi.json`) are available only when `E
 
 | Code | Meaning |
 |---|---|
-| `400` | Invalid input, or the question was blocked by Prompt Guard |
+| `400` | Invalid input |
 | `401` | Missing, invalid or expired token |
 | `403` | Quota reached (boxes per user, documents per box) or access denied |
 | `404` | Box, session or document not found (also used for boxes you do not own) |
@@ -1012,7 +996,7 @@ The backend reads settings from **`backend/.env`**: [`config.py`](backend/app/co
 ### 10.2 Set up Supabase
 
 1. Create a project at <https://supabase.com>.
-2. Open **SQL Editor** and run the schema files and migrations **in the order shown in [§7](#schema-files-and-migrations-apply-in-this-order)**.
+2. Open **SQL Editor** and run [`backend/schema.sql`](backend/schema.sql).
 3. Under **Authentication → Providers**, enable **Email**. Under **Authentication → URL Configuration**, add `http://localhost:3000/auth/callback` as a redirect URL.
 4. From **Project Settings → API**, copy the **Project URL**, the **anon key** (frontend) and the **service_role key** (backend).
 
@@ -1120,29 +1104,14 @@ Run these from `backend/` with the virtual environment active (for example `pyth
 
 ---
 
-## 13. Deployment Notes
-
-### Production checklist
-
-- [ ] Set all backend variables in the host's environment dashboard. Use the **service role key** only on the backend.
-- [ ] Set `CORS_ORIGINS` to your real frontend URL(s), for example `https://<your-app>.vercel.app`.
-- [ ] Keep `ENABLE_API_DOCS=false`.
-- [ ] Set `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` in your frontend host, then redeploy.
-- [ ] Add the production `/auth/callback` URL to Supabase Auth redirect URLs.
-- [ ] Give the backend at least about 2 GB RAM. Models load at startup, so expect a slow first boot.
-- [ ] Run **one backend worker process** (see [§16](#16-known-limitations--roadmap)), or move ingestion to a durable queue first.
-- [ ] Optionally keep a free-tier backend warm by pinging the health endpoint **`GET /`** every 15 minutes.
-
----
-
-## 14. Security Model
+## 13. Security Model
 
 | Layer | Control |
 |---|---|
 | **Authentication** | Supabase JWT, verified server-side with Supabase on each new token (cached 60 s, so revoked sessions stop working within a minute). |
 | **Authorization** | Every box-scoped endpoint calls `verify_box_access(box_id, user_id)`. Sessions and documents are also checked to belong to the box. "Not yours" and "not found" both return 404, so other users' box IDs cannot be probed. |
 | **Database** | Row-Level Security on all tables; the dense-search RPC is executable only by `service_role`; default `EXECUTE` privileges are revoked from `anon` and `authenticated`; users cannot insert `system` chat rows (which would otherwise be replayed to the LLM as instructions). |
-| **Prompt injection** | Every question is screened by **Llama Prompt Guard 2 (86M)** on Groq. Scores above 0.5 are rejected. The check *fails open* if Groq is unreachable, so availability is preserved. The answer prompt also tells the model to use only the CONTEXT. |
+| **Prompt defense** | Strictly grounded system prompt forcing the model to rely only on retrieved CONTEXT, forbidding invented IDs, pages, quotations or external assumptions. |
 | **File uploads** | Extension allow-list, MIME sanity check, magic-byte validation, zip-bomb cap, streaming size cap, `Content-Length` pre-check, SHA-256 de-duplication, server-generated file names, temp files always cleaned up. |
 | **Abuse limits** | Per-user rate limits, box and document quotas, question length cap, ingestion backpressure. |
 | **HTTP headers (API)** | `default-src 'none'` CSP, `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, HSTS, `Cache-Control: no-store`. |
@@ -1152,7 +1121,7 @@ Run these from `backend/` with the virtual environment active (for example `pyth
 
 ---
 
-## 15. Resilience & Performance
+## 14. Resilience & Performance
 
 - **Non-blocking I/O.** Blocking Supabase calls in async routes run in Starlette's threadpool; sync routes run in FastAPI's threadpool.
 - **Smart retries.** `tenacity` with exponential backoff, applied only to transient errors (connection errors, 429, 5xx). Errors such as 400 or 401 fail fast.
@@ -1167,7 +1136,7 @@ Run these from `backend/` with the virtual environment active (for example `pyth
 
 ---
 
-## 16. Known Limitations & Roadmap
+## 15. Known Limitations
 
 | Limitation | Notes / suggested direction |
 |---|---|
@@ -1180,7 +1149,7 @@ Run these from `backend/` with the virtual environment active (for example `pyth
 
 ---
 
-## 17. Troubleshooting
+## 16. Troubleshooting
 
 | Symptom | Likely cause and fix |
 |---|---|
