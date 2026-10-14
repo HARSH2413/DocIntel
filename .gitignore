@@ -16,7 +16,11 @@ __pycache__/
 
 # --- OS / IDE Files ---
 .DS_Store
-.vscode/ 
+.vscode/
+.continue/
+
+# --- Extra venvs at root ---
+test_venv/
 
 # google credentials
 google_credentials.json
